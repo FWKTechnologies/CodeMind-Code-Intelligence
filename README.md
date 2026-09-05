@@ -1,4 +1,199 @@
-# Offline Graph Cache Builder — A Deep Technical Reference
+# CodeMind — Full Training Architecture, In Depth
+
+**A self-hosted, multi-language code-understanding and code-generation system, trained end-to-end on a single rented GPU instance**
+
+This document explains the complete training pipeline: what happens to a single training sample from the moment it's read off disk to the moment it updates model weights, what the major subsystems are, which of them were substantially rebuilt from an earlier, simpler version under the *same name*, the concrete parameters the model is trained with, and the hardware it's designed against.
+
+---
+
+## 0. Target hardware and scale
+
+The system is explicitly sized for one specific rented configuration:
+
+| Resource | Spec |
+|---|---|
+| GPU | 1× H100 SXM, 80 GB VRAM |
+| vCPU | 20 |
+| System RAM | 125 GB |
+| Local SSD cache | 50 GB |
+| OS | Linux (RunPod) |
+
+The model itself lands at **~3.29 billion parameters**, arrived at by cross-checking two independent constraints rather than picking a round number: a data-volume-based estimate (roughly 90 GB of code text, effectively passed over twice by the dual-brain design, worked out against a standard compute-optimal token-to-parameter ratio) and a VRAM-ceiling estimate (80 GB, minus a reserved margin for activations/PPO buffers/optional instruction-embedding bridge/CUDA overhead, divided by the per-parameter memory cost of bf16 weights + bf16 gradients + fp32 master weights + fp32 Adam optimizer state). Both approaches converge on roughly the same number, which is what actually sets the model's width and depth below — not an arbitrary target.
+
+An earlier iteration of this same codebase was originally built and tested against a single RTX 3060 (12 GB VRAM) on a Windows machine with 16 GB RAM. That code path is intentionally still present as a fallback (Windows-specific handling, CPU-only degradation, smaller default sizing) — it isn't dead code, it's what the project runs on when the H100 isn't available — but the numbers described below are the current defaults, tuned specifically for the H100 box.
+
+## 1. The full training loop, end to end
+
+```mermaid
+flowchart TD
+    subgraph Data["Data layer"]
+        DS["train.jsonl<br/>(streamed, never fully loaded)"]
+        SSD["Local SSD shard cache<br/>pre-parsed samples,<br/>size-budgeted"]
+        GC["Graph cache<br/>(on-disk + optional<br/>offline-built bundle)"]
+        PF["Parallel prefetcher<br/>process pool, one worker<br/>per CPU core"]
+        DS --> SSD --> PF
+        GC -.->|cache hit, zero CPU work| PF
+    end
+
+    subgraph Batch["Batch assembly"]
+        PROD["Producer thread<br/>pulls prefetched samples"]
+        BUF["Batch buffer<br/>fills to batch_size,<br/>or flushes early on timeout"]
+        PF --> PROD --> BUF
+    end
+
+    subgraph Represent["Per-sample representation"]
+        ENC["Token-efficient encoder<br/>(instruction / NL side)"]
+        TENS["Graph tensorizer<br/>CodeGraph → batched tensors"]
+        QW["Optional: Qwen instruction<br/>embedding bridge<br/>(pre-computed cache)"]
+        BUF --> ENC
+        BUF --> TENS
+        BUF -.-> QW
+    end
+
+    subgraph DualBrain["Dual-brain reasoning (heterogeneous graph transformer)"]
+        RA{"Phase router<br/>A or B, alternating"}
+        BRA["Brain A — 'understand'<br/>8 HGT layers"]
+        BRB["Brain B — 'edit'<br/>7 HGT layers"]
+        BRIDGE["Anti-forget bridge<br/>EWC-style penalty +<br/>experience replay"]
+        FUSE["Semantic fusion"]
+        ENC --> RA
+        TENS --> RA
+        QW --> RA
+        RA -- "A" --> BRA --> BRIDGE
+        RA -- "B" --> BRB --> BRIDGE
+        BRIDGE --> FUSE
+    end
+
+    subgraph Generate["Decoding & policy"]
+        DEC["Grammar-based decoder<br/>generates an AST action<br/>sequence, not raw tokens"]
+        POL["Policy head<br/>(PPO actor)"]
+        FUSE --> DEC
+        FUSE --> POL
+    end
+
+    subgraph Score["Scoring & reward"]
+        VAL["Validator<br/>static analysis +<br/>optional real execution"]
+        QE["Quality engine"]
+        RWD["Curiosity-driven PPO reward<br/>(novelty + trust + baseline)"]
+        DEC --> VAL --> QE
+        POL --> RWD
+        VAL --> RWD
+    end
+
+    subgraph Optimize["Loss & optimization"]
+        LOSS["Multi-term loss<br/>contrastive + semantic +<br/>validate-head + graph-reg + PPO"]
+        NAN["Per-layer NaN/Inf guard"]
+        OOM["OOM-safe backoff<br/>(halves batch, never crashes)"]
+        STEP["AdamW step<br/>(momentum persisted<br/>across resumes)"]
+        QE --> LOSS
+        RWD --> LOSS
+        LOSS --> NAN --> STEP
+        STEP -.->|on OOM| OOM -.-> BUF
+    end
+
+    subgraph Checkpoint["Durability & control"]
+        CK["Checkpoint save<br/>rotating slots, every N steps<br/>+ on graceful shutdown"]
+        GATE{"Validation quality<br/>≥ target, or<br/>patience exhausted?"}
+        STEP --> CK --> GATE
+        GATE -- "no" --> BUF
+        GATE -- "yes" --> DONE["Training stops"]
+    end
+
+    style DualBrain fill:#e8f0fe,stroke:#4285f4
+    style Optimize fill:#fef7e0,stroke:#f9ab00
+    style Checkpoint fill:#e6f4ea,stroke:#34a853
+    style Score fill:#fce8e6,stroke:#ea4335
+```
+
+The loop above runs once per micro-batch, and the whole dataset is swept multiple times ("rounds" — four by default). Two things make repeated rounds cheap instead of ruinous: the **graph cache** (Data layer, above — covered in full detail in the companion document on the offline graph-cache builder) means the CPU-heavy parsing step only ever happens once per unique sample across all rounds, and the **dual-brain alternation** (A/B phases below) means those rounds aren't simply "the same thing four times" — they're structured as alternating passes between two different reasoning roles.
+
+## 2. Data layer, in more depth
+
+Three caching layers sit between the raw dataset and the model, each solving a different problem:
+
+- **The SSD shard cache** exists because converting a raw JSON line into a structured, typed sample is itself non-trivial work, and re-doing that for the same lines on every pass is wasteful in the same way re-parsing is. Pre-parsed shards are written once and reused, budgeted so they never exceed a configured size.
+- **The graph cache** stores the actual output of static analysis — the code property graphs and validation results — keyed by a content hash of the sample so identical content always resolves to the identical cache entry regardless of where it sits in the file. This is the layer the standalone offline builder (described separately) populates ahead of time, before any GPU is rented.
+- **The parallel prefetcher** is what actually drives both of the above during training: a pool of worker *processes* (not threads — the parsing and validation work is pure-Python CPU work, which a thread pool would serialize behind the interpreter's global lock; separate processes genuinely run on separate cores) kept several batches ahead of what the GPU is currently consuming, so the GPU is never waiting on CPU work that could have been done in advance.
+
+Batches aren't filled strictly to a fixed count before being sent to the GPU, either. A producer thread pulls finished samples and fills a buffer; if the buffer hasn't reached full size within a short timeout, a partial batch is flushed anyway rather than let the GPU sit idle waiting for a full batch that a temporarily slow sample is holding up.
+
+## 3. The dual-brain design
+
+The model doesn't have one graph-reasoning module — it has two, referred to as Brain A ("understand") and Brain B ("edit"), each a heterogeneous graph transformer (HGT) stack of its own depth (currently 8 layers for A, 7 for B), operating on the same typed node/edge graph representation but trained on an alternating schedule rather than jointly on every sample.
+
+The reason two separate stacks exist instead of one is to give the "editing" behavior room to specialize without overwriting what the "understanding" behavior has already learned — a known failure mode in models that get pushed toward two related-but-different skills over a long training run is that gains in one erode the other. The **anti-forget bridge** between the two brains is where that trade-off is actively managed:
+
+- It applies an **EWC-style penalty** (elastic weight consolidation — a term that discourages phase-B updates from moving too far from what phase-A previously anchored) rather than leaving the two phases completely free to drift apart.
+- It maintains an **experience replay buffer**, so phase-B training periodically revisits phase-A-style examples instead of only ever seeing edit-style examples in long uninterrupted stretches.
+- It computes a **bridge reward** — a signal fed back into the reinforcement-learning side of training that reflects how well the fused representation preserves what phase A understood.
+
+Which phase runs on any given round is controlled by an alternation setting (`dual_two_rounds`), and each phase's sample count is tracked independently so the system knows exactly how much of the dataset each brain has actually seen.
+
+## 4. From graph to code: the decoder
+
+Once the dual-brain stack and semantic fusion have produced a representation of "what should be generated," the decoder doesn't emit plain text tokens the way a typical code-generation model would. It emits a sequence of **AST construction actions** — a grammar-constrained action codec that describes *build a function node*, *attach this statement*, *this is a call to that*, and so on — which is then rendered back into source code deterministically. This was a deliberate move away from an earlier static-vocabulary text sampler: generating structurally-valid actions instead of free-form tokens means the decoder can't produce something that *looks* like code but is syntactically broken in the way an unconstrained token sampler occasionally can — the action grammar itself rules that out.
+
+Generation has a hard ceiling on how many actions it will emit before abstaining rather than guessing further — a deliberate choice to have the model say "I don't have a confident answer" past a certain length rather than degrade into low-quality continuation.
+
+## 5. Validation, reward, and reinforcement learning
+
+Every generated (or ground-truth target, during supervised phases) piece of code passes through a **validator** that performs static analysis and — when explicitly enabled — actually executes the code to check real correctness, not just plausible-looking structure. The validator also checks for **integrity**: whether the output is genuinely code, or a hollow stub (`pass`, `...`, `raise NotImplementedError` with nothing else), or prose mixed in with code, or a copy of the prompt disguised as an answer. A model that produces well-formatted nonsense should score badly here even if it "looks" plausible.
+
+On top of raw validation, a **curiosity-driven reward** feeds the PPO (Proximal Policy Optimization) reinforcement-learning loop: it isn't just "did the code pass," but a combination of novelty (has the policy already mastered very similar samples, in which case there's less to learn here), a trust signal that adjusts how much weight to put on the model's own recent behavior, and a running baseline that reward is measured against rather than an absolute fixed target. This is what lets the training signal keep being useful even after the model is already fairly good — a flat pass/fail reward stops discriminating once most outputs pass, but a novelty/trust-adjusted reward keeps distinguishing "boring, already-mastered" outputs from "hard, still-improving" ones.
+
+## 6. Loss composition and optimization mechanics
+
+The total training loss is not one number — it's a weighted combination of (at least) five distinct terms: a contrastive term, a semantic-alignment term, a term tied to the validator head's own prediction, a graph-structure regularization term, and a PPO policy term. All five are tracked and reported separately, per pass, specifically so that a *falling total loss* can't hide one component that's actually stagnant or getting worse — an earlier version of this reporting only surfaced the breakdown when something was already flagged as stagnant, which meant a healthy-looking single number could be quietly propped up by one term while another sat flat for an entire pass without anyone noticing until much later.
+
+Optimization runs with gradient accumulation — a modest micro-batch is accumulated over several forward/backward passes before every optimizer step, giving a much larger *effective* batch size than what actually has to fit in VRAM at once. If a given micro-batch size turns out to be too large for available VRAM at runtime, an automatic backoff halves it on the fly rather than crashing and losing the rented GPU session outright. Every optimizer step also runs through a per-layer NaN/Inf guard, so a numerical blow-up in one layer gets caught and handled at the layer it happened in, rather than surfacing as a mysterious loss explosion several steps later with no indication of where it started.
+
+## 7. Same names, rebuilt internals
+
+Several components kept their original names across the project's history but had their actual internal behavior substantially replaced. This is worth calling out explicitly, because "same class name" does not mean "same implementation" anywhere in this list:
+
+- **The graph-structure detector.** Originally, non-Python languages were checked for structural correctness using a shallow heuristic — bracket-balance counting and a handful of safety regexes. That approach can't tell the difference between code that's merely bracket-balanced and code that's actually syntactically valid (`functoin foo() {}` sails through a bracket counter untouched). It was replaced with a real parser (tree-sitter-backed) for those languages, so structural errors are now caught with the same precision Python already had via its own native parser — the class and its call sites are unchanged; what happens inside for a non-Python file is not.
+- **The parsing/validation concurrency model.** Originally a thread pool. Pure-Python CPU work doesn't parallelize under threads the way it looks like it should, because of the interpreter's global lock — a thread pool "parsing on 8 threads" was, for this kind of work, running on effectively one core the whole time. It was replaced with a process pool, where each worker genuinely owns a core; the code-level *shape* of "submit work, collect results" is the same, but the actual parallelism only started existing after this change.
+- **The generation decoder.** Originally a static-vocabulary sampler predicting tokens against a fixed vocabulary. It's now a grammar-constrained action-sequence generator (see Section 4) — the decoder module still occupies the same architectural slot in the pipeline, but what it predicts and how its output is turned into code changed completely.
+- **Checkpointing.** Originally saved model weights only. Two categories of state were missing and have since been added into the same checkpoint mechanism: the optimizer's own momentum state (without it, every resume effectively restarted Adam's momentum from zero, causing a visible loss spike right after every resume that a smoothly-continuing training curve should never show), and a graceful-shutdown path so a process-manager-issued stop signal triggers an orderly checkpoint save instead of losing however many steps had accumulated since the last scheduled save.
+- **The "reduce memory usage" story.** A separate monitoring/diagnostics layer (unrelated to this repo, referenced only because it was initially assumed to reduce VRAM usage) turned out to help *utilize* available VRAM more efficiently and diagnose pressure faster, but does not and cannot make more VRAM exist or make an oversized graph fit that otherwise wouldn't. The actual VRAM reduction in this system comes from a direct, structural change: capping the maximum number of nodes considered per graph, which is a real, linear-ish reduction in tensor size per step — a different mechanism entirely from the monitoring layer, even though both get discussed under "memory management."
+- **An FP8 storage path that was quietly a no-op.** A configuration flag and supporting module existed, implying trained weights could be compressed to 8-bit storage. On inspection, the cast only ever happened transiently inside a forward pass during evaluation and was converted straight back before any matmul — nothing about how a parameter is actually stored on disk or in memory was ever affected by it. It produced no VRAM or disk savings while giving the impression that it did, which is arguably worse than not having the feature at all. It has since been removed outright rather than left in a half-working state, with old saved configs that still reference the flag simply ignored instead of erroring.
+
+## 8. Key parameters as currently configured
+
+| Parameter | Value | What it controls |
+|---|---|---|
+| Hidden dimension | 1664 | Width shared across both brains and the decoder |
+| Brain A depth | 8 HGT layers | "Understand" reasoning depth |
+| Brain B depth | 7 HGT layers | "Edit" reasoning depth (intentionally close to, but slightly shallower than, A) |
+| Attention heads | 64 | Attention granularity |
+| Max graph nodes | 4096 | Per-sample graph size cap (larger graphs are subsampled) |
+| Decoder depth | 9 layers | Action-sequence generation depth |
+| Decoder attention heads | 16 | — |
+| Decoder max sequence length | 2048 actions | Generation length ceiling |
+| Generation abstain ceiling | 2600 actions | Past this, the model abstains rather than guessing |
+| Dropout | 0.1 | Applied across brain and decoder |
+| Routing experts (instruction router) | 6 | Diversity across language families |
+| PPO replay buffer size | 16 | Policy-gradient stability |
+| Total parameters | ≈3.29B | Across both brains, decoder, encoder, and RL/bridge overhead |
+| Training rounds over the dataset | 4 (configurable) | Multiplies raw CPU parsing cost if not cached — see the graph-cache document |
+| Micro-batch size | 128 | Auto-backs off on OOM |
+| Gradient accumulation | 8 steps | Effective batch size = 1024 |
+| Learning rate | 2e-4 | With warmup + decay, correctly resumed across restarts |
+| Quality target (early stop) | 85% validation quality | Training stops once reached |
+| Early-stop patience | 3 passes without improvement | — |
+| Checkpoint interval | Every 200 steps, plus on shutdown signal | Bounded progress loss on interruption |
+| Checkpoint rotation | 3 rolling slots | Disk-budget vs. rollback depth trade-off |
+
+## 9. What this adds up to
+
+None of the individual pieces above are exotic in isolation — process pools, gradient accumulation, EWC-style regularization, and PPO are all standard tools. What defines this system is how they're wired together around one central constraint: everything that *can* run cheaply, ahead of time, or in parallel with the GPU, has been deliberately pulled out of the GPU's critical path, and everything that touches durability (checkpoints, resumability, graceful shutdown, OOM handling) is built to fail toward "lose the least possible amount of expensive compute time" rather than toward silent correctness risk or an outright crash.
+
+---
+
+# Appendix: The Offline Graph-Cache Builder (Data-layer detail)
+
+The "Graph cache" box in Section 2 above is populated by a standalone script that can run entirely separately from training, on ordinary CPU hardware, before any GPU is even rented. The rest of this appendix explains that script on its own.
+
 
 **Part of the CodeMind project — a self-hosted, multi-language code-understanding and code-generation system**
 
