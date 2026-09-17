@@ -1,1 +1,295 @@
+# CodeMind Code Intelligence License
 
+## Version 1.0 (CM-CIL-1.0)
+
+**Copyright © 2026 FWK Technologies. All rights reserved.**
+
+---
+
+## 1. Overview
+
+The **CodeMind Code Intelligence License** ("License") allows individuals, students, educators, researchers, developers, startups, organizations, and businesses to freely use and build upon the CodeMind artificial intelligence model, subject to the terms of this License.
+
+The goal of this License is to allow CodeMind to be used broadly for learning, research, experimentation, software development, commercial products, startups, education, and other legitimate purposes while preserving proper credit to the original developer.
+
+The model covered by this License is referred to as the **"Licensed Model."**
+
+---
+
+## 2. Permissions
+
+Subject to compliance with this License, FWK Technologies grants you a worldwide, non-exclusive, royalty-free, perpetual license to use the Licensed Model.
+
+You are permitted to:
+
+* use the Licensed Model for personal use;
+* use the Licensed Model for educational purposes;
+* use the Licensed Model for academic study and research;
+* use the Licensed Model for experimentation and development;
+* use the Licensed Model in student projects, school projects, university projects, and independent projects;
+* use the Licensed Model to develop applications, tools, services, products, and platforms;
+* use the Licensed Model to create or operate a startup or business;
+* use the Licensed Model for commercial purposes;
+* modify the Licensed Model;
+* fine-tune or further train the Licensed Model;
+* adapt, optimize, quantize, prune, compress, merge, or otherwise modify the Licensed Model;
+* create derivative models based on the Licensed Model;
+* integrate the Licensed Model into other software or systems;
+* deploy the Licensed Model locally, on servers, in cloud infrastructure, or as part of a service;
+* redistribute the Licensed Model or a derivative model, subject to the attribution requirements of this License; and
+* create and commercialize products or services based on the Licensed Model.
+
+No royalty or licensing fee is required solely for exercising the rights expressly granted by this License.
+
+---
+
+## 3. Freedom to Create and Commercialize
+
+You are free to build upon CodeMind for any lawful purpose, including commercial purposes.
+
+This includes, without limitation:
+
+* commercial software;
+* SaaS products;
+* developer tools;
+* AI-powered applications;
+* coding assistants;
+* internal business tools;
+* educational products;
+* research systems;
+* consulting services;
+* startups;
+* independent projects; and
+* other products or services.
+
+You may charge money for products or services that use, include, or are based on the Licensed Model.
+
+The commercial use of the Licensed Model does not require payment to FWK Technologies.
+
+---
+
+## 4. Modification and Further Training
+
+You may modify, improve, adapt, fine-tune, or further train the Licensed Model.
+
+This includes, without limitation:
+
+* fine-tuning;
+* continued pre-training;
+* instruction tuning;
+* domain adaptation;
+* quantization;
+* pruning;
+* optimization;
+* model merging;
+* distillation;
+* architectural modification;
+* conversion to other supported formats; and
+* creation of derivative models.
+
+You may publish, distribute, or commercially use the resulting derivative model, provided that the attribution requirements of this License are preserved.
+
+---
+
+## 5. Source Code Is Not Required
+
+This License applies to the Licensed Model and does not require you to release or publish your own source code.
+
+You are not required to disclose:
+
+* application source code;
+* private infrastructure code;
+* deployment code;
+* training code;
+* fine-tuning code;
+* proprietary datasets;
+* proprietary algorithms; or
+* other independent software or materials created by you.
+
+Using or modifying the Licensed Model does not, by itself, require you to open-source your software or product.
+
+---
+
+## 6. Derivative Models
+
+A **"Derivative Model"** means a model or model checkpoint that is based on, derived from, fine-tuned from, merged with, distilled from, quantized from, or otherwise substantially incorporates the Licensed Model.
+
+You may create, name, modify, publish, distribute, and commercialize Derivative Models.
+
+A Derivative Model may use a different:
+
+* model name;
+* product name;
+* version number;
+* branding;
+* user interface; or
+* additional license terms applicable to your own contributions.
+
+However, changing the name or branding of a Derivative Model does not remove the attribution requirements in this License.
+
+---
+
+## 7. Attribution Requirement
+
+Any use, publication, distribution, integration, or commercialization of the Licensed Model or a Derivative Model must preserve reasonable attribution to the original model and its developer.
+
+The attribution must identify:
+
+**CodeMind**
+**Developed by FWK Technologies**
+
+The attribution must remain reasonably accessible to users or recipients of the Licensed Model or Derivative Model.
+
+The attribution may appear in a location appropriate to the nature of the product or distribution method, including:
+
+* model documentation;
+* model cards;
+* repository pages;
+* README files;
+* documentation;
+* software metadata;
+* package metadata;
+* an About page;
+* a Credits page;
+* an Acknowledgements section;
+* a legal notices section;
+* product documentation;
+* application information pages; or
+* another comparable location where attribution is normally provided.
+
+---
+
+## 8. Reduced or Abbreviated Attribution
+
+The attribution requirement does not require CodeMind or FWK Technologies to be displayed as the most prominent name or branding in your product.
+
+You may:
+
+* use a smaller font;
+* use less prominent placement;
+* place the attribution in documentation rather than the primary interface;
+* place the attribution in a Credits or About section;
+* shorten the visual presentation of the attribution; or
+* use a reasonable abbreviated form.
+
+Examples of acceptable abbreviated attribution include:
+
+**CodeMind by FWK Technologies**
+
+or
+
+**CodeMind — FWK Technologies**
+
+or another substantially equivalent form that clearly identifies CodeMind and FWK Technologies as the original model and developer.
+
+The attribution must remain readable and reasonably accessible.
+
+It must not be intentionally hidden, removed, obscured, or presented in a way that falsely suggests that another party originally created CodeMind.
+
+---
+
+## 9. Branding and Trademarks
+
+**CodeMind** and **FWK Technologies**, including associated logos, names, trademarks, and service marks, remain the property of their respective owner(s).
+
+This License does not grant permission to use these names or marks in a manner that falsely implies:
+
+* official endorsement;
+* sponsorship;
+* certification;
+* partnership;
+* ownership by another party;
+* official authorship of a modified model; or
+* affiliation with FWK Technologies.
+
+You may truthfully refer to CodeMind and FWK Technologies for attribution and compatibility purposes.
+
+---
+
+## 10. Independent Branding
+
+You may give a Derivative Model its own name and branding.
+
+You may commercially distribute and promote your Derivative Model under your own brand.
+
+However, you must not claim or imply that the Derivative Model is an official version of CodeMind or that it is created, certified, sponsored, or officially maintained by FWK Technologies unless you have received separate written permission.
+
+---
+
+## 11. Third-Party Components and Materials
+
+The Licensed Model may include or rely upon components, datasets, tokenizers, libraries, or other materials that are subject to separate third-party licenses.
+
+This License only grants rights that FWK Technologies is legally entitled to grant.
+
+Where third-party materials are identified as being subject to separate license terms, those materials remain subject to their respective licenses.
+
+You are responsible for complying with applicable third-party license requirements.
+
+---
+
+## 12. No Obligation to Provide Support
+
+This License does not require FWK Technologies to provide:
+
+* technical support;
+* maintenance;
+* updates;
+* bug fixes;
+* new model versions;
+* security updates;
+* training resources; or
+* other services.
+
+FWK Technologies may choose to provide such services separately.
+
+---
+
+## 13. No Warranty
+
+THE LICENSED MODEL IS PROVIDED **"AS IS" AND "AS AVAILABLE"**, WITHOUT WARRANTIES OF ANY KIND, WHETHER EXPRESS, IMPLIED, OR STATUTORY.
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, FWK TECHNOLOGIES DISCLAIMS WARRANTIES INCLUDING, BUT NOT LIMITED TO, MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, ACCURACY, RELIABILITY, AVAILABILITY, NON-INFRINGEMENT, AND PERFORMANCE.
+
+FWK TECHNOLOGIES DOES NOT GUARANTEE THAT THE LICENSED MODEL WILL BE ERROR-FREE, SECURE, UNINTERRUPTED, OR SUITABLE FOR ANY PARTICULAR USE.
+
+---
+
+## 14. Limitation of Liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, FWK TECHNOLOGIES SHALL NOT BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, EXEMPLARY, OR PUNITIVE DAMAGES ARISING FROM OR RELATED TO THE USE OF THE LICENSED MODEL OR THIS LICENSE.
+
+THIS INCLUDES, WITHOUT LIMITATION, LOSS OF PROFITS, REVENUE, DATA, BUSINESS, GOODWILL, OR OTHER INTANGIBLE LOSSES.
+
+---
+
+## 15. Termination for Breach
+
+The rights granted by this License may terminate if you materially violate its terms.
+
+If the violation is corrected, rights may be reinstated where permitted by applicable law.
+
+Termination does not invalidate rights that were lawfully granted to recipients who received the Licensed Model or a Derivative Model before the termination of your rights.
+
+---
+
+## 16. Reservation of Rights
+
+Except for the rights expressly granted by this License, all other rights are reserved by FWK Technologies.
+
+This License does not transfer ownership of the Licensed Model, CodeMind, or the intellectual property of FWK Technologies.
+
+---
+
+## 17. Acceptance
+
+By downloading, accessing, using, modifying, fine-tuning, distributing, deploying, or otherwise using the Licensed Model, you acknowledge that you have read, understood, and agreed to the terms of the **CodeMind Code Intelligence License**.
+
+---
+
+**CodeMind Code Intelligence License**
+**Version 1.0 (CM-CIL-1.0)**
+
+**Copyright © 2026 FWK Technologies. All rights reserved.**
+
+**CodeMind is a product and/or brand of FWK Technologies.**
