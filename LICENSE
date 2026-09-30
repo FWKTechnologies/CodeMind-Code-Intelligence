@@ -1,295 +1,669 @@
-# CodeMind Code Intelligence License
+# CodeMind 2.0 — Architecture Overview (Detailed Edition)
 
-## Version 1.0 (CM-CIL-1.0)
+**A self-hosted, multi-language, graph-based code-understanding and code-generation system — now with a built-in natural-language brain, deterministic math, policy-driven safety, and a hardened web-search subsystem.**
 
-**Copyright © 2026 FWK Technologies. All rights reserved.**
+> **Document version:** 2.0 — describes **CodeMind 2** (source markers `v84`–`v89`, plus the final hardening pass).
+> This document **replaces** the 1.0 overview. The two describe different generations of the system; where 1.0 and 2.0 disagree, 2.0 is the one checked against the current source. Section 2 lists every material difference.
 
----
-
-## 1. Overview
-
-The **CodeMind Code Intelligence License** ("License") allows individuals, students, educators, researchers, developers, startups, organizations, and businesses to freely use and build upon the CodeMind artificial intelligence model, subject to the terms of this License.
-
-The goal of this License is to allow CodeMind to be used broadly for learning, research, experimentation, software development, commercial products, startups, education, and other legitimate purposes while preserving proper credit to the original developer.
-
-The model covered by this License is referred to as the **"Licensed Model."**
+> **Confidentiality & IP Notice**
+> Every mechanism below was checked against the real implementation (`CodeMind.py`, `codemind_brain_dual.py`, `build_graph_cache.py`, `search.py`, `linguistic_safety.py`). To protect the project's intellectual property, this document **explains what each part does and why it exists**, but it deliberately **contains no source excerpts, no loss/reward coefficients, no tuned thresholds, no regular expressions, no training data, and no model weights**. Scale figures (layer counts, widths, expert counts, context lengths) are given because they are needed to understand the design. The repository, not this document, is the source of truth.
 
 ---
 
-## 2. Permissions
+## License & Repository
 
-Subject to compliance with this License, FWK Technologies grants you a worldwide, non-exclusive, royalty-free, perpetual license to use the Licensed Model.
+The real license and README live in the repository; they are linked rather than restated so they cannot drift out of sync:
 
-You are permitted to:
-
-* use the Licensed Model for personal use;
-* use the Licensed Model for educational purposes;
-* use the Licensed Model for academic study and research;
-* use the Licensed Model for experimentation and development;
-* use the Licensed Model in student projects, school projects, university projects, and independent projects;
-* use the Licensed Model to develop applications, tools, services, products, and platforms;
-* use the Licensed Model to create or operate a startup or business;
-* use the Licensed Model for commercial purposes;
-* modify the Licensed Model;
-* fine-tune or further train the Licensed Model;
-* adapt, optimize, quantize, prune, compress, merge, or otherwise modify the Licensed Model;
-* create derivative models based on the Licensed Model;
-* integrate the Licensed Model into other software or systems;
-* deploy the Licensed Model locally, on servers, in cloud infrastructure, or as part of a service;
-* redistribute the Licensed Model or a derivative model, subject to the attribution requirements of this License; and
-* create and commercialize products or services based on the Licensed Model.
-
-No royalty or licensing fee is required solely for exercising the rights expressly granted by this License.
+- **Repository:** [FWKTechnologies/CodeMind-Code-Intelligence](https://github.com/FWKTechnologies/CodeMind-Code-Intelligence/tree/main)
+- **License:** [LICENSE](https://github.com/FWKTechnologies/CodeMind-Code-Intelligence/tree/main/LICENSE)
+- **README:** [README.md](https://github.com/FWKTechnologies/CodeMind-Code-Intelligence/tree/main/README.md)
 
 ---
 
-## 3. Freedom to Create and Commercialize
+## Table of Contents
 
-You are free to build upon CodeMind for any lawful purpose, including commercial purposes.
-
-This includes, without limitation:
-
-* commercial software;
-* SaaS products;
-* developer tools;
-* AI-powered applications;
-* coding assistants;
-* internal business tools;
-* educational products;
-* research systems;
-* consulting services;
-* startups;
-* independent projects; and
-* other products or services.
-
-You may charge money for products or services that use, include, or are based on the Licensed Model.
-
-The commercial use of the Licensed Model does not require payment to FWK Technologies.
-
----
-
-## 4. Modification and Further Training
-
-You may modify, improve, adapt, fine-tune, or further train the Licensed Model.
-
-This includes, without limitation:
-
-* fine-tuning;
-* continued pre-training;
-* instruction tuning;
-* domain adaptation;
-* quantization;
-* pruning;
-* optimization;
-* model merging;
-* distillation;
-* architectural modification;
-* conversion to other supported formats; and
-* creation of derivative models.
-
-You may publish, distribute, or commercially use the resulting derivative model, provided that the attribution requirements of this License are preserved.
+1. [Executive Summary](#1-executive-summary)
+2. [What Changed Since 1.0](#2-what-changed-since-10)
+3. [What CodeMind Is — and Isn't](#3-what-codemind-is--and-isnt)
+4. [System Map and File Roles](#4-system-map-and-file-roles)
+5. [Input Side: Languages, Parsing, Human-Language Graphs](#5-input-side-languages-parsing-human-language-graphs)
+6. [The Graph Schema](#6-the-graph-schema)
+7. [Encoding: From Graph to Tensors](#7-encoding-from-graph-to-tensors)
+8. [The HGT Layer and the HGT Brain](#8-the-hgt-layer-and-the-hgt-brain)
+9. [The Three-Brain Design (C → A → B)](#9-the-three-brain-design-c--a--b)
+10. [Mixture-of-Experts Routing (FlyPrompt)](#10-mixture-of-experts-routing-flyprompt)
+11. [The Anti-Forget Bridge](#11-the-anti-forget-bridge)
+12. [Graph Collapsing](#12-graph-collapsing)
+13. [From Graph to Code: Generation](#13-from-graph-to-code-generation)
+14. [Validation and Quality Scoring](#14-validation-and-quality-scoring)
+15. [Learning Objectives](#15-learning-objectives)
+16. [Reinforcement Learning (Curiosity PPO)](#16-reinforcement-learning-curiosity-ppo)
+17. [Deterministic Math and Physics Engine](#17-deterministic-math-and-physics-engine)
+18. [Linguistic Safety (Policy-Driven)](#18-linguistic-safety-policy-driven)
+19. [Web Search Subsystem](#19-web-search-subsystem)
+20. [Data Pipeline and the Offline Graph Cache](#20-data-pipeline-and-the-offline-graph-cache)
+21. [Training Runtime and Reliability](#21-training-runtime-and-reliability)
+22. [Serving, CLI, Packaging, Security Posture](#22-serving-cli-packaging-security-posture)
+23. [Engineering History: Real Bugs, Real Fixes](#23-engineering-history-real-bugs-real-fixes)
+24. [Key Parameters](#24-key-parameters)
+25. [Realistic Scope & Open Questions](#25-realistic-scope--open-questions)
+26. [Component Index](#26-component-index)
 
 ---
 
-## 5. Source Code Is Not Required
+## 1. Executive Summary
 
-This License applies to the Licensed Model and does not require you to release or publish your own source code.
+CodeMind represents source code as a **typed, heterogeneous graph** rather than a flat token sequence, and reasons over that graph with **Heterogeneous Graph Transformer (HGT)** stacks. CodeMind 2 runs **three** specialized HGT brains in a chain:
 
-You are not required to disclose:
+- **Brain C** reads *human-language* text (instructions, comments, docstrings — any language) as a graph of word nodes.
+- **Brain A** reads the code graph to *understand* structure, conditioned on what Brain C understood.
+- **Brain B** *proposes edits*, conditioned on what Brain A understood.
 
-* application source code;
-* private infrastructure code;
-* deployment code;
-* training code;
-* fine-tuning code;
-* proprietary datasets;
-* proprietary algorithms; or
-* other independent software or materials created by you.
+The three are joined by one learned **anti-forget bridge** and steered by one **mixture-of-experts router** that keeps a separate routing bias per brain. A dedicated causal transformer (**CodeDecoder**) turns the fused understanding into a sequence of *structural actions*, which a renderer turns back into source text. Training combines supervised objectives with a **Curiosity-PPO** loop rewarded by a multi-layer automated validator.
 
-Using or modifying the Licensed Model does not, by itself, require you to open-source your software or product.
+Around that core, CodeMind 2 adds: a deterministic **math/physics engine**, a **policy-driven linguistic-safety** module (no built-in definition of "right" and "wrong" — you supply the policy), and a **web-search subsystem** engineered to never hang, never leak secrets, and never trust what it fetches.
+
+The system is designed to be trained on **a single rented GPU instance**. CodeMind 2 is sized for one NVIDIA B200 (180 GB); the previous generation targeted one H100 (80 GB), and the original prototype an RTX 3060 (12 GB) — those lower-end paths still work through deliberate fallbacks.
 
 ---
 
-## 6. Derivative Models
+## 2. What Changed Since 1.0
 
-A **"Derivative Model"** means a model or model checkpoint that is based on, derived from, fine-tuned from, merged with, distilled from, quantized from, or otherwise substantially incorporates the Licensed Model.
+| Area | 1.0 | 2.0 (current source) |
+|---|---|---|
+| Brains | Two (A "understand", B "edit") | **Three**: C (language) → A (code) → B (edit). Brain C is another instance of the *same* HGT class, not a separate model |
+| Training phases | A → B | **C → A → B → unified** (the two-phase A → B path is kept behind a flag for starting a fresh CodeMind-1-style model) |
+| Routing | 6 experts, top-2, one router | **12 experts, top-3**, one router with a **3-row task-bias table** (one row per brain), plus an **expert-communication block** |
+| Router losses | A single load-balance term | Load balance (Switch-style, using measured load), **router z-loss**, **importance (CV²) loss**, plus an **auxiliary-loss-free bias** that nudges selection toward under-used experts |
+| Bridge anchor | Overwritten each round | **Online-EWC style**: decayed blend of old and new anchors, so early-round knowledge is not erased |
+| Graph node types | 14 | **15** (adds `word`) |
+| Graph edge types | — | **31** typed relations (adds `word→next→word`, `word→near→word`, plus 8 previously-missing relations that were fixed) |
+| Supported languages | "58" in older docs | **68** registered language specs (see §5) |
+| Collapse budget | 1,024 nodes | **12,288 nodes** (configured `max_nodes`; 1,024 survives only as an orchestrator fallback default) |
+| Decoder positions | Learned absolute table | **Rotary position embeddings (RoPE)** by default; flash-attention via fused SDPA |
+| Decoder context | — | **170,000-position ceiling**, **140,000 train length**, with a length curriculum |
+| Precision | BF16 (FP8 flag removed in v76) | BF16 autocast; TF32 on; FP8 confirmed gone |
+| Hardware target | H100 SXM | **B200 SXM (180 GB)**, H100/3060 fallbacks retained |
+| Parameter scale | ≈3.29B (CodeMind 1 figure) | **≈5.8–5.9B** by architecture arithmetic (estimate; see §24) |
+| Extra subsystems | — | Math engine, linguistic safety, web search, appropriateness head, reward-side language signals |
+| Checkpoints | Rotating slots | Single `.safetensors` file + JSON meta; head weights saved atomically; `weights_only` loading |
 
-You may create, name, modify, publish, distribute, and commercialize Derivative Models.
+**Corrections to statements in 1.0** (the 1.0 text is preserved in the repository history; these are the points that do not match the current source):
 
-A Derivative Model may use a different:
-
-* model name;
-* product name;
-* version number;
-* branding;
-* user interface; or
-* additional license terms applicable to your own contributions.
-
-However, changing the name or branding of a Derivative Model does not remove the attribution requirements in this License.
-
----
-
-## 7. Attribution Requirement
-
-Any use, publication, distribution, integration, or commercialization of the Licensed Model or a Derivative Model must preserve reasonable attribution to the original model and its developer.
-
-The attribution must identify:
-
-**CodeMind**
-**Developed by FWK Technologies**
-
-The attribution must remain reasonably accessible to users or recipients of the Licensed Model or Derivative Model.
-
-The attribution may appear in a location appropriate to the nature of the product or distribution method, including:
-
-* model documentation;
-* model cards;
-* repository pages;
-* README files;
-* documentation;
-* software metadata;
-* package metadata;
-* an About page;
-* a Credits page;
-* an Acknowledgements section;
-* a legal notices section;
-* product documentation;
-* application information pages; or
-* another comparable location where attribution is normally provided.
+1. *Per-node router.* 1.0 described a second router (`PerNodeFlyPromptRouter`) that routes every node separately. **No such class exists in the current source.** Routing is one decision per graph (on a pooled embedding), as described in §10.
+2. *Parameter count.* "≈3.29B" is the CodeMind 1 figure. CodeMind 2 adds Brain C (16 layers), more experts and a larger decoder.
+3. *Collapse budget.* The budget actually used in training and serving is the configured `max_nodes` (12,288), not 1,024.
+4. *Load-balancing loss.* The simple squared-deviation form in 1.0 was replaced; see §10.
+5. *Task conditioning.* The task-bias table now has one row per brain (three), not two.
 
 ---
 
-## 8. Reduced or Abbreviated Attribution
+## 3. What CodeMind Is — and Isn't
 
-The attribution requirement does not require CodeMind or FWK Technologies to be displayed as the most prominent name or branding in your product.
-
-You may:
-
-* use a smaller font;
-* use less prominent placement;
-* place the attribution in documentation rather than the primary interface;
-* place the attribution in a Credits or About section;
-* shorten the visual presentation of the attribution; or
-* use a reasonable abbreviated form.
-
-Examples of acceptable abbreviated attribution include:
-
-**CodeMind by FWK Technologies**
-
-or
-
-**CodeMind — FWK Technologies**
-
-or another substantially equivalent form that clearly identifies CodeMind and FWK Technologies as the original model and developer.
-
-The attribution must remain readable and reasonably accessible.
-
-It must not be intentionally hidden, removed, obscured, or presented in a way that falsely suggests that another party originally created CodeMind.
+| It is... | It is not... |
+|---|---|
+| A graph-based system: code becomes a typed heterogeneous graph (functions, calls, variables, control flow, data flow, dependencies) | A large language model: there is no flat token sequence as the primary computation unit |
+| Three stacks of one HGT class (language, understand, edit) joined by a learned bridge | One shared stack trying to do everything, or three unrelated models |
+| Trained with supervised losses **plus** a PPO loop scored by an automated validator | Trained purely by next-token prediction |
+| Generation constrained to structural actions from a closed vocabulary (`GraphActionCodec`), decoded by a causal transformer | Free-form sampling over an open text vocabulary |
+| A front end that branches by language (native `ast` for Python, tree-sitter where a grammar is available, a generic fallback) | Many models, one per language — everything after parsing shares one schema and one set of weights |
+| Honest about uncertainty: it can **abstain** instead of guessing | A system that always answers |
+| Policy-driven for safety: *you* define categories, weights and actions | A system with hard-coded moral judgments in its weights or source |
 
 ---
 
-## 9. Branding and Trademarks
+## 4. System Map and File Roles
 
-**CodeMind** and **FWK Technologies**, including associated logos, names, trademarks, and service marks, remain the property of their respective owner(s).
+```mermaid
+flowchart LR
+    subgraph IN[Input]
+      T[Instruction / prompt text] --> NLD[NLDetector]
+      NLD --> LG[build_language_graph<br/>word nodes]
+      S[Source code] --> P[MultiLanguageParser<br/>Python ast / tree-sitter / generic]
+      P --> CPG[CodeGraph<br/>AST·CFG·DFG·PDG·Call·SDG]
+    end
+    LG --> TZ1[GraphTensorizer]
+    CPG --> GC[GraphCollapser]
+    GC --> TZ2[GraphTensorizer]
+    TZ1 --> BC[Brain C · language]
+    BC --> R[FlyPromptRouter<br/>task 2]
+    TZ2 --> BA[Brain A · understand]
+    R --> BR1[AntiForgetBridge]
+    BR1 --> BA
+    BA --> R2[FlyPromptRouter<br/>task 0]
+    R2 --> BR2[AntiForgetBridge]
+    BR2 --> BB[Brain B · edit<br/>task 1]
+    BB --> DEC[CodeDecoder<br/>+ GraphActionCodec]
+    DEC --> REN[GraphRenderer → source text]
+    DEC --> V[CodeValidator]
+    V --> RW[CuriosityPPOReward → PPOAgent]
+    V --> Q[QualityEngine 0–100]
+```
 
-This License does not grant permission to use these names or marks in a manner that falsely implies:
+The same bridge module and the same router instance serve all three hand-offs; what differs is the **task id** (C = 2, A = 0, B = 1) that selects the routing bias row.
 
-* official endorsement;
-* sponsorship;
-* certification;
-* partnership;
-* ownership by another party;
-* official authorship of a modified model; or
-* affiliation with FWK Technologies.
+**The five source files**
 
-You may truthfully refer to CodeMind and FWK Technologies for attribution and compatibility purposes.
-
----
-
-## 10. Independent Branding
-
-You may give a Derivative Model its own name and branding.
-
-You may commercially distribute and promote your Derivative Model under your own brand.
-
-However, you must not claim or imply that the Derivative Model is an official version of CodeMind or that it is created, certified, sponsored, or officially maintained by FWK Technologies unless you have received separate written permission.
-
----
-
-## 11. Third-Party Components and Materials
-
-The Licensed Model may include or rely upon components, datasets, tokenizers, libraries, or other materials that are subject to separate third-party licenses.
-
-This License only grants rights that FWK Technologies is legally entitled to grant.
-
-Where third-party materials are identified as being subject to separate license terms, those materials remain subject to their respective licenses.
-
-You are responsible for complying with applicable third-party license requirements.
-
----
-
-## 12. No Obligation to Provide Support
-
-This License does not require FWK Technologies to provide:
-
-* technical support;
-* maintenance;
-* updates;
-* bug fixes;
-* new model versions;
-* security updates;
-* training resources; or
-* other services.
-
-FWK Technologies may choose to provide such services separately.
+| File | Role |
+|---|---|
+| `CodeMind.py` | The core: parsing, graph schema, encoder, HGT, decoder, validator, PPO, loss, data connector, training pipeline, runtime/API/CLI, packaging, math engine |
+| `codemind_brain_dual.py` | The multi-brain machinery: FlyPrompt router, experts, expert communication, anti-forget bridge, graph collapser, the orchestrator that runs phases C/A/B, dual-brain save/load, dataset-size measurement |
+| `build_graph_cache.py` | Offline, CPU-only pre-builder of parsed graphs so a rented GPU never waits on parsing |
+| `search.py` (v4) | The web-search and page-fetch subsystem |
+| `linguistic_safety.py` (v3) | The policy-driven linguistic-safety and PII/secret-detection module |
 
 ---
 
-## 13. No Warranty
+## 5. Input Side: Languages, Parsing, Human-Language Graphs
 
-THE LICENSED MODEL IS PROVIDED **"AS IS" AND "AS AVAILABLE"**, WITHOUT WARRANTIES OF ANY KIND, WHETHER EXPRESS, IMPLIED, OR STATUTORY.
+### 5.1 Language registry
 
-TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, FWK TECHNOLOGIES DISCLAIMS WARRANTIES INCLUDING, BUT NOT LIMITED TO, MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, ACCURACY, RELIABILITY, AVAILABILITY, NON-INFRINGEMENT, AND PERFORMANCE.
+`LanguageRegistry` resolves a language id, a file extension or a content sniff to a **language spec** and a **language family**. The family decides how aggressively the polyglot linker wires two files together. The table is open-ended — adding a language is adding a spec, not writing a new parser.
 
-FWK TECHNOLOGIES DOES NOT GUARANTEE THAT THE LICENSED MODEL WILL BE ERROR-FREE, SECURE, UNINTERRUPTED, OR SUITABLE FOR ANY PARTICULAR USE.
+The current source registers **68 language specs** spanning:
 
----
+- **General-purpose:** Python, JavaScript, TypeScript (+ JSX/TSX), Java, Kotlin, Scala, C, C++, C#, Go, Rust, Swift, Objective-C, Dart, Zig, Ruby, PHP, Perl, Lua, R, Julia, Haskell, Elixir, Erlang, Clojure, F#, OCaml, Lisp, Racket, Nim, Crystal, Fortran, Ada, Pascal, VB, MATLAB, D, Groovy, Tcl
+- **Data / query / schema:** SQL, GraphQL, Protobuf, JSON, YAML, TOML, XML, Markdown, LaTeX
+- **Web / UI:** HTML, CSS, SCSS, Vue, Svelte
+- **Infrastructure / build / shell:** Dockerfile, Makefile, CMake, Terraform, HCL, Bash, PowerShell, Batch, AWK
+- **Systems / other:** Solidity, WebAssembly, Assembly, GDScript
 
-## 14. Limitation of Liability
+Language detection from raw text combines cheap structural signals with a per-language evidence table, scoring every candidate; when there is no evidence at all it falls back to Python.
 
-TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, FWK TECHNOLOGIES SHALL NOT BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, EXEMPLARY, OR PUNITIVE DAMAGES ARISING FROM OR RELATED TO THE USE OF THE LICENSED MODEL OR THIS LICENSE.
+### 5.2 Three graph builders
 
-THIS INCLUDES, WITHOUT LIMITATION, LOSS OF PROFITS, REVENUE, DATA, BUSINESS, GOODWILL, OR OTHER INTANGIBLE LOSSES.
+Parsing branches by language, exactly as the design intends:
 
----
+- **Python (understanding path):** a native walk over the standard-library `ast` module (`_PythonCPGBuilder`, reached through `CPGBuilder`). It builds the AST, control-flow, data-flow, program-dependence, call and system-dependence layers with real semantic analysis (for example real definition-use chains and control dependence, rather than textual proximity).
+- **Languages with a registered grammar:** `TreeSitterASTBuilder`, backed by a real tree-sitter grammar.
+- **Everything else:** `GenericASTBuilder`, a family-aware line/pattern-based fallback that still produces the full layered schema, so even languages with no grammar installed get a non-empty structural signal.
 
-## 15. Termination for Breach
+A deliberate exception applies to **generation**: the codec that encodes target code for the decoder *always* uses the generic builder, for every language including Python. This guarantees that all languages are encoded at the same granularity (function / statement / call level), so one decoder learns from all of them. "Understanding" (Brain A/B) keeps the richer per-language builders. The two paths do different jobs and do not interfere.
 
-The rights granted by this License may terminate if you materially violate its terms.
+### 5.3 Polyglot projects
 
-If the violation is corrected, rights may be reinstated where permitted by applicable law.
+`PolyglotProject` and `PolyglotLinker` merge the graphs of 3–7 languages into **one** graph and add cross-language edges: API routes matched to HTTP clients, `fetch`/`require`/`import` links, shared configuration wiring, and same-family hints. `MultiProjectConnector` handles real repositories: it indexes files, groups them into RAM-budgeted batches, parses batch by batch, merges through the linker and collapses before the HGT sees the result. It is designed for projects of hundreds to thousands of files without loading them all at once; projects under ~50 files take a direct fast path.
 
-Termination does not invalidate rights that were lawfully granted to recipients who received the Licensed Model or a Derivative Model before the termination of your rights.
+### 5.4 Human-language graphs (new in 2.0)
 
----
+Brain C does not use a tokenizer or vocabulary of its own. `build_language_graph` converts text in *any* human language into a graph of `word` nodes joined by `next` (sequence) and `near` (proximity) edges. Because the graph schema is simply extended, Brain C is the same class as Brain A/B and uses the same encoder. That is the design principle of the whole system: **everything flows through one graph schema, whether the input is code in any language or text in any language.**
 
-## 16. Reservation of Rights
-
-Except for the rights expressly granted by this License, all other rights are reserved by FWK Technologies.
-
-This License does not transfer ownership of the Licensed Model, CodeMind, or the intellectual property of FWK Technologies.
-
----
-
-## 17. Acceptance
-
-By downloading, accessing, using, modifying, fine-tuning, distributing, deploying, or otherwise using the Licensed Model, you acknowledge that you have read, understood, and agreed to the terms of the **CodeMind Code Intelligence License**.
+`NLDetector` identifies the human language and script of a text *without a fixed language list*: it returns a language code, the script and a confidence, and reports `und-<Script>` when the script is recognized but the language is not. It is safe to call from many threads and is what lets safety and reward logic choose the right language rules per message instead of assuming one.
 
 ---
 
-**CodeMind Code Intelligence License**
-**Version 1.0 (CM-CIL-1.0)**
+## 6. The Graph Schema
 
-**Copyright © 2026 FWK Technologies. All rights reserved.**
+**15 node types**
 
-**CodeMind is a product and/or brand of FWK Technologies.**
+| Group | Node types | Meaning |
+|---|---|---|
+| Program layers | `ast`, `cfg`, `dfg`, `pdg`, `call`, `sdg` | Syntax, control-flow, data-flow, program-dependence, call-graph and system-dependence nodes |
+| Code structure | `func`, `block`, `expr`, `stmt`, `token` | Functions, blocks, expressions, statements and lexical tokens |
+| Polyglot markers | `lang`, `api`, `config` | Language hosts, API bindings, configuration wiring |
+| Human language | `word` | A word in a natural-language graph (Brain C) |
+
+**31 typed relations**, in families:
+
+- **Structure:** AST child / next-sibling; function *contains* AST; token *belongs to* AST.
+- **Control flow:** CFG flow and branch (including branch → body block).
+- **Data and dependence:** DFG dataflow; PDG control- and data-dependence.
+- **Calls:** call *invokes* function; call *returns*; SDG inter-procedural and SDG *invokes* function.
+- **Cross-layer mapping:** AST → CFG → PDG and DFG → PDG `maps_to` links that let information cross layers.
+- **Polyglot:** cross-language function links; language *hosts* function/AST; API *binds* call; config *wires* statement; language same-family / coexists; language *wires* config.
+- **Containment refinements:** expression/statement contains a call; AST wraps statement; call wraps SDG call-site.
+- **Language:** word `next` word; word `near` word.
+
+Every relation has its **own learned attention weights** in the HGT (§8). This matters: an audit of the schema found that eight relations the builders were already creating had never been declared, so they had silently fallen through to an unweighted path. They are now first-class.
+
+---
+
+## 7. Encoding: From Graph to Tensors
+
+**`TokenEfficientEncoder`** turns node labels into vectors without a fitted vocabulary. It combines a hashed-token embedding with a learned identity embedding, plus **language** and **language-family** embeddings and a projection, compressing graph-node text far more than raw subword tokenization would. A later refinement added two order-aware signals: positional embeddings per token position and an **attention pooling** with a learnable query, blended in through a gate that starts almost closed so existing checkpoints behave the same at load time. Because it is hash-based it needs no fitting and works for every language — the reason Brain C needs no tokenizer of its own. Repeated tokens are hashed once and remembered, since code is highly repetitive.
+
+**`GraphTensorizer`** converts a `CodeGraph` to per-type feature tensors and per-relation edge indices. For training it can pack many graphs into one **block-diagonal batch** with per-graph index vectors, so pooling stays per graph. It is built so that the single-graph inference path is unchanged.
+
+**`SemanticFusion`** combines the token-efficient encoding with the HGT output.
+
+---
+
+## 8. The HGT Layer and the HGT Brain
+
+### 8.1 `HGTLayer`
+
+The layer implements type-specialized attention (Hu et al., WWW 2020). In words:
+
+- Every **node type** has its own projections for queries, keys, values and output, so an `ast` node, a `call` node and a `word` node are each transformed by parameters that belong to their type.
+- Every **relation** (source type, relation name, destination type) has its own learned **relation tensor per attention head**. Before an attention score is computed, a neighbor's key is transformed through that relation's tensor. This is the concrete mechanism behind "a *call* edge and a *data-flow* edge are attended to differently."
+- Attention is normalized **per destination node** over all incoming edges; the attention-weighted messages are aggregated per destination (averaged by message count), combined with a skip connection from the node's own input, dropped out and layer-normalized **per node type**.
+
+Two implementation facts were real engineering decisions:
+
+- A **per-forward cache** of key/value projections. They depend only on the *source* type, which is shared across relations, so each is computed once per pass — a pure speed-up with identical numbers.
+- **Vectorized per-destination softmax** using scatter reductions, with a slower loop retained only for old PyTorch versions. (§23 records a real bug in exactly this function.)
+
+### 8.2 `HGTBrain`
+
+A brain is: per-type input projection → a stack of HGT layers (with **gradient checkpointing** per layer during training) → **learnable weighted pooling** across node types → a semantic head. The pooling weights per node type start from a prior that favors functions, calls and data-flow over raw syntax and lexical tokens, but they are **trained parameters**, not constants.
+
+Each brain exposes task heads on its pooled semantic vector: *understand*, *generate*, a *validity* scalar, and a **multi-label issue head** over six categories (syntax, security, safety, undefined variable, unused import, other). The issue head is trained with real supervision from what the validator actually found, which lets `understand()` return a per-category self-check instead of only one aggregate number.
+
+All three brains share the same hidden width and head count; they differ only in depth.
+
+---
+
+## 9. The Three-Brain Design (C → A → B)
+
+| Brain | Reads | Job | Depth |
+|---|---|---|---|
+| **C** | Human-language graph (instruction text, any language) | Understand what is being asked | 16 layers |
+| **A** | Code graph | Understand code structure | 8 layers |
+| **B** | Code graph | Propose edits | 7 layers |
+
+Brain C is deepest because its job is broadest (every human language, not one code schema). Brain B is one layer shallower than A by intent, but close enough that the anti-forget machinery stays balanced.
+
+**How one training sample flows.** Brain C produces an embedding of the instruction. Brain A routes its own understanding through the router (task 0), then **fuses Brain C's embedding through the bridge**. Brain B routes (task 1) and fuses Brain A's embedding through the same bridge. Each fusion is computed on the *actual output for that very sample* (detached from the upstream brain, so gradients do not flow backwards into earlier brains), while a separate slowly-moving **anchor** exists only for the forgetting penalty and the bridge reward.
+
+**Why sequential phases rather than joint training.** Training one stack to do several jobs at once tends to let one skill erode another over a long run. Phases train one brain at a time; when a phase ends its anchor is recorded, and later phases are penalized for drifting away from it (§11). The orchestrator tracks epochs and samples per phase and keeps small replay buffers for code and for language.
+
+**Phase semantics.** The pipeline can stop early when validation quality reaches a target or stops improving. Because each phase trains a *different* brain, the validation score of one phase is not comparable to the next. In dual-brain mode the pipeline therefore **always completes every planned phase**: a stop condition met at the end of one phase is logged and the next phase still runs (patience is reset). The single-epoch mode keeps the classic early stop.
+
+**Brain C extras.** Two small objectives keep Brain C honest about language rather than merely predictive of code embeddings:
+
+- A **masked-word feature objective** (`LanguageMaskHead`): a fraction of words in a prompt are hidden and Brain C must recover their input features from context. It needs no per-language vocabulary, reuses the same forward pass as the main loss, and is weighted moderately so code remains the primary goal.
+- A **`LossBalancer`** keeps the language term at a target share of total loss, adapting to measured loss sizes with smooth updates and hard bounds (balance by loss magnitude stands in for balance by gradient, at no extra backward cost).
+- An **`AppropriatenessHead`**: a very small classifier on Brain C's (detached) embedding predicting two independent axes — *severity* (how much care the content needs) and *casualness* (register). No gradient from it reaches the brains, so it cannot distort the main architecture.
+
+The language brain can be switched off, reverting to the two-phase design for a fresh CodeMind-1-style model. Old CodeMind-1 checkpoints are **not** loadable into CodeMind 2 — the routing-bias table changed shape on purpose, and the loader says so explicitly.
+
+---
+
+## 10. Mixture-of-Experts Routing (FlyPrompt)
+
+The router is inspired by fruit-fly-style random expansion: a pooled embedding is normalized, scored by a gate, biased by a learned **per-task vector**, lightly perturbed during training, and the **top-k** experts (k = 3 of 12) are run. **Selected weights are renormalized to sum to one** so output scale does not shrink as experts are added.
+
+- **One decision per graph.** The router works on the pooled embedding, not per node.
+- **Per-task bias.** The bias is a table with one row per brain. (Before CodeMind 2 it was a single shared vector, and the task id was ignored — meaning Brain A and Brain B had been routed identically. See §23.)
+- **Experts** are small feed-forward networks with pre-normalization and a slow exponential moving average of their own output blended back in, damping batch-to-batch swings. Only the selected experts actually run (sparse execution).
+- **Expert communication.** Selected experts do not work blind: before their outputs are merged, a small single-layer self-attention block lets them *see each other's outputs*, through a gated residual that starts nearly closed and opens only if training finds it useful.
+- **Collapse protection.** Four mechanisms work together: (1) a Switch-Transformer-style balance loss built from *measured* expert load averaged across calls; (2) a router **z-loss** that stops gate logits growing until the softmax saturates; (3) an **importance loss** on the spread of gate mass, which load alone cannot see; (4) an **auxiliary-loss-free selection bias** that pushes *selection* (not mixing weights) toward under-used experts during training, so dead experts are not abandoned. Auxiliary losses from every router call in a step are accumulated and **averaged once per step**, because one router serves several tasks and items and each must receive gradient.
+- **Diagnostics.** Each call reports routing entropy, maximum expert load (near one-over-E means balanced, near 1.0 means collapse), the auxiliary losses and the chosen experts.
+
+---
+
+## 11. The Anti-Forget Bridge
+
+`AntiForgetBridge` hands understanding from one brain to the next and does three jobs in one small module:
+
+1. **Gated fusion.** Both inputs are projected; a learned gate decides, per sample, how much of the result leans on the upstream brain versus a joint projection of both; a final layer norm keeps scales comparable.
+2. **An EWC-lite penalty.** A diagonal, Fisher-style approximation of Elastic Weight Consolidation penalizes the downstream output for drifting away from a stored anchor of the upstream brain's embeddings — without a full Fisher pass.
+3. **A bridge reward.** The cosine similarity between the upstream embedding and the fused output, mapped to [0, 1] and smoothed, feeds the PPO reward (§16): retaining upstream knowledge earns a small bonus, catastrophic drift a small penalty.
+
+**Anchor maintenance (corrected in CodeMind 2).** The anchor and importance estimates used to be overwritten at the end of each phase with the last round's replay samples alone, so after several rounds only the *most recent* round was protected — the opposite of the class's purpose. They are now blended with exponential decay (online-EWC style), so traces of earlier rounds remain. The first call bootstraps directly, so the start of a fresh training run is unchanged.
+
+---
+
+## 12. Graph Collapsing
+
+`GraphCollapser` shrinks a graph toward the node budget before the HGT sees it. In training and serving the budget is the configured **`max_nodes` (12,288)**; graphs already under it are returned untouched. Collapsing runs in stages:
+
+1. **Exact-duplicate merge** (by node type and label), in linear time, except for a protected set of structurally load-bearing types.
+2. **Edge remap and de-duplication** after the merge.
+3. **Linear-chain bypass**: a low-importance node with exactly one predecessor and one successor is bypassed (A → B → C becomes A → C), unless it is an *anchor* type (function, call, data-flow, system-dependence) or carries an entry-point-like name (main, init, handler, router, …).
+4. **Importance trimming** only if still over budget, using degree, type and keyword weights. Entry, call and data-flow structure is never cut.
+
+`CollapseStats` records nodes and edges before/after, duplicates merged and chains collapsed, so the step is inspectable. A real bug in stage 3 was fixed in CodeMind 2: edges left after a chain bypass could still point at nodes that had just been deleted. The 12,288-node budget is a trade-off: larger graphs lose less structure, at roughly linear (not quadratic) extra memory.
+
+---
+
+## 13. From Graph to Code: Generation
+
+### 13.1 Action codec
+
+`GraphActionCodec` is the single codec for the whole system. It walks a target graph's *generatable* nodes in a defined order and emits a sequence of **structural actions** from a **closed vocabulary** (line-level labels for functions, statements and calls, ~8,000 entries). The vocabulary is fitted from your own corpus once (`fit_generator_tokenizer`) and saved as `gen_codec.json`, which is a required companion to the weights. `GraphRenderer` turns an action sequence back into formatted source text per language family.
+
+Trade-off, stated plainly: Python is not special-cased on this path, so there is no guarantee-by-construction of syntax validity as a built-in `ast.unparse` would give. One decoder learning from every language, controlled by the validator and PPO loop, is the intended alternative.
+
+### 13.2 The decoder
+
+`CodeDecoder` is a decoder-only transformer (9 layers, width matching the brains, 16 heads) whose every step depends on what it has already generated. The fused brain embedding is injected as **memory-prefix tokens** (eight) that every position can attend to, so generation is conditioned on the graph rather than on metadata glued to a prompt.
+
+- **Positions:** rotary position embeddings (RoPE), the default since v88. The older absolute-table mode remains only for backward compatibility.
+- **Long context:** a **170,000-position ceiling** and **140,000-position training length**, reached through a **length curriculum** (starting near 4,096 and rising over the first quarter of training) so the expensive lengths are not forced when the model benefits least. Attention uses the fused flash-style kernel, so memory grows linearly with length; compute still grows with its square, which is an accepted cost.
+- **Ceilings are separated from serving limits.** The structural ceiling is a property of the weights. Any operator-facing output limit lives in a separate runtime config (§22) and defaults to unlimited; the stop conditions are the model's own end signal and a repeat-cycle guard.
+- **Incremental decoding.** Generation reuses cached keys/values. When the context reaches the ceiling the window slides and the cache is rebuilt, but with slack so the rebuild happens once every several steps rather than every step.
+
+### 13.3 Decoding behavior
+
+The production decoder is **deterministic greedy** with an anti-cycle guard. A temperature divides the logits before the argmax, which never changes which action wins — so calling `generate()` repeatedly returns the same answer. That is appropriate for one answer, but it means naive best-of-N would produce N identical candidates. CodeMind therefore provides:
+
+- **`generate_rl`** — a genuinely stochastic sampler used by reinforcement learning.
+- **`generate_best_of`** — draws diverse candidates and **re-ranks them with the validator**, for callers who want to spend more compute on one final answer.
+- **Abstention** — if validation says the output is unsafe to ship (cheating pattern, hollow code that does not run, demonstrably wrong behavior, too many errors), `generate()` **abstains** unless the caller passes `force`. A request-level output limit, when supplied, is honored per call.
+
+### 13.4 Large code
+
+`LargeCodeHandler` edits or generates code from 10,000 to 500,000+ lines by chunking at function/class boundaries (never mid-function), processing chunk by chunk, carrying a **semantic context embedding** from one chunk to the next in addition to textual tail context, and stitching outputs back with indentation preserved. It streams, so the whole file is never resident at once.
+
+---
+
+## 14. Validation and Quality Scoring
+
+`CodeValidator` layers independent checks, combined **multiplicatively where appropriate** so a single failure cannot be hidden by strength elsewhere:
+
+1. **`StaticAnalyzer`** — language-aware syntax, undefined names and unused imports where a real parser exists, plus a **safety** check for dangerous constructs (careful but non-blocking, so learning is not stopped).
+2. **`IntegrityChecker`** — catches *cheating*: hollow stubs, prompt echoes, prose mixed with code.
+3. **`CodePurityChecker`** — how much of the output is actually code versus noise.
+4. **Optional execution** — for Python, in an isolated subprocess, skipped automatically if a dangerous pattern was found. When a reference is supplied, `_exec_and_compare` checks that the code is *behaviorally right*, not merely that it ran.
+5. **Structural similarity** — when a reference graph is supplied, a data-flow / control-flow similarity check works **without execution** and for any language.
+6. **Project validation** — `validate_project` scores a polyglot project file by file against each file's own language rules.
+
+The `ValidationResult` carries validity, a score in [-1, 1], issues, human-readable feedback, execution status, integrity, safety, purity, cheating flag, abstain advice and, when evidence exists, logic score and behavior match.
+
+**`QualityEngine`** turns this into a 0–100 **model quality** score along six dimensions — syntax, static checks, graph coverage, semantic similarity, execution, and mastery (how well the model already knows this kind of code). It is deliberately multi-dimensional: a low loss with hollow outputs should not look like quality. `run_quality_audit` and `verify_ai_spec` self-check the loss/quality pipeline and confirm the system matches its intended specification, before or after training.
+
+---
+
+## 15. Learning Objectives
+
+`CodeMindLoss` is a weighted combination of six objectives:
+
+- **Contrastive alignment** between source and target embeddings. A historical bug made this term exactly zero: training uses one (source, target) pair per step, so the similarity matrix was 1×1 and its softmax is always 1. A small FIFO **bank of recent target embeddings** now supplies real negatives at almost no cost.
+- **Semantic** objective on the fused understanding.
+- **Validity** prediction against the validator.
+- **Graph-structure** objective.
+- **Policy** objective from PPO.
+- **Issue-type** multi-label objective trained from real validator findings.
+
+On top of these, phase-specific terms apply: the EWC-lite penalty (downstream brains), the router's averaged auxiliary loss, and Brain C's masked-word and appropriateness objectives. The decoder is trained **inline with the main step** from the embedding already computed, so there is no second forward pass and no separate decoder stage.
+
+---
+
+## 16. Reinforcement Learning (Curiosity PPO)
+
+`PPOAgent` uses a `CodePolicyHead` that emits a policy, a value and a **confidence**; it keeps a frozen **reference policy** copy, computes advantages with GAE, and updates in **batches of tensor operations** only once its replay buffer is full enough (single-sample updates are too noisy). Rewards are normalized with a running statistic across updates, and a `RunningBaseline` makes the reward track *improvement* rather than an absolute constant.
+
+`CuriosityPPOReward` assembles the reward from separate, visible dimensions:
+
+- **Correctness** — the validator score, mapped to [0, 1].
+- **Curiosity** — novelty of the input (`CuriosityMemory`), scaled by integrity so novelty of garbage is not rewarded.
+- **Calibration** — confidence should match reality: over-confidence is penalized, appropriate humility is rewarded.
+- **Honesty** — abstaining when invalid is rewarded, cheating is penalized, valid output is rewarded.
+- **Integrity and purity**, **safety** of the code, and an explicit **logic** term when real behavioral or structural evidence exists.
+- **Bridge retention** — from §11.
+- **Trust** — a 0–100 `TrustTracker` moves with outcomes: confident errors and cheating cost a lot; calibrated abstention earns a little.
+
+Three **auxiliary** terms are deliberately small: a *linguistic-safety* signal (§18), a *register* signal, and a *math verification* signal (§17). A `RewardWeightAdapter` tunes only these auxiliary terms, within bounds, based on measured statistics — it cannot rescale the primary terms.
+
+An `ExperienceBank` remembers how well each kind of code is already mastered (bounded hot cache in RAM, persistent store on disk) and lets training **skip re-learning mastered code** while prioritizing low-mastery samples.
+
+---
+
+## 17. Deterministic Math and Physics Engine
+
+Language models do arithmetic unreliably, so CodeMind carries an exact engine. It performs **unit-aware calculation** (values stored in SI with dimensional analysis — mismatched dimensions are errors, not silently wrong numbers), and includes:
+
+- a safe expression evaluator producing quantities with units, with optional conversion of the result,
+- **exact rational linear-system solving** (Gauss–Jordan with pivoting on fractions),
+- root finding that requires a bracketing sign change,
+- adaptive numerical integration of smooth functions,
+- numerical derivatives with extrapolation for higher accuracy,
+- an adaptive Runge–Kutta integrator for simple physical simulation (springs, orbits, …),
+- a **text verifier** that scans "expression = number" statements in generated text, recomputes them and reports a verdict — the source of the math reward term in §16,
+- **training-data generators** whose answers are checked by the engine itself.
+
+It is exposed as the `/calc` endpoint and the `calc`, `mathgen` and `mathtest` commands, and works without loading any model.
+
+---
+
+## 18. Linguistic Safety (Policy-Driven)
+
+The module's founding principle is unchanged from v1: **there is no fixed, built-in definition of "right" and "wrong" in the source.** Category names, weights, thresholds and actions (block / flag / ignore) come from **your own policy file**; wordlists shipped in the source are only mild examples. The code provides the *mechanism*, not the judgment. The mechanism was hardened against concrete failures measured in earlier versions:
+
+- **Word-boundary matching** for space-delimited scripts (so short risky strings do not match inside innocent words or code identifiers), with combining marks of Indic, Thai and Arabic counted as part of the word. **Substring matching plus an editable "safe words" list** for scripts without spaces (Thai, Chinese, Japanese, Lao, Khmer, Burmese), so ordinary words that merely contain a risky fragment are not blocked.
+- **Targeted obfuscation handling:** digit-for-letter substitution is undone only inside tokens that mix letters and digits (so version numbers and laughter like "555" are not mangled); repeated-letter stretching; separator tricks; invisible characters (zero-width, bidirectional controls, tag characters); look-alike Cyrillic/Greek letters inside Latin words; stacked combining marks used as noise — all without damaging scripts where combining marks carry meaning.
+- **Sarcasm markers** can lower severity (a reward signal) but **cannot unblock** a message unless your policy explicitly allows it, so they cannot be used to launder content by appending "just kidding."
+- **A threshold of zero means "block immediately"**, not "unset" (an older bug treated it as unset).
+- **PII and secret detection with real validation:** checksums (Luhn, the Thai national ID check digit, IBAN mod-97) replace naive digit counting, so timestamps and order numbers are not reported as card numbers. Secret detection covers common cloud/API/token/connection-string formats and high-entropy strings. **Reports store only masked values**, so a secret is never copied into a log.
+- **Multi-language analysis:** code-switched text is checked against its primary and secondary languages; unknown languages are checked against every available wordlist; codes such as `zh-CN` and `th_TH` are accepted.
+- **Performance and robustness:** wordlists compile to cached per-language matchers; PII is scanned **once** per message and shared between redaction and reporting; repeated reward-side analysis of the same text is cached; redaction is linear-time; e-mail and connection-string patterns are length-bounded so adversarial long inputs cannot cause quadratic slowdowns. Over-long messages are analyzed at both head and tail — the places content is usually hidden — and flagged `scan_clipped`, so the caller can choose to reject abnormal lengths.
+
+Inside CodeMind this module only contributes a **small, auxiliary** reward term; it never decides whether code is valid (that is the validator's job).
+
+---
+
+## 19. Web Search Subsystem
+
+`search.py` (v4) provides search and page retrieval with one priority above all: **never hang, never stall the server, never leak, never trust.**
+
+**Reliability**
+
+- One shared worker pool and a **per-request overall deadline**; when time runs out the system returns what it has. It returns immediately when the primary backend answers, waiting only briefly for others.
+- HTTP calls have a true **total-time ceiling**, not just a per-read timeout (a server dripping bytes cannot stall a worker).
+- **Circuit breakers** in half-open mode (one probe at a time); rate-limit and auth responses are handled at once without retry storms.
+- **Single-flight** for identical concurrent queries (one backend call), and a **cap on concurrent searches** rather than an endless queue.
+- **Cache** with *stale-if-error* (if a backend is down, answers up to a day old are served instead of nothing), debounced disk writes from a separate thread, and thread-local status.
+
+**Search quality**
+
+- **Backends.** Keyless: Wikipedia, StackExchange, arXiv, PubMed, GitHub (chosen by query category). Optional keyed: Brave, SearXNG, Google Custom Search, SerpAPI. Without a keyed backend, only the keyless sources are available for general web search.
+- A curated **catalog of roughly 590 official and reputable domains** worldwide — governments, international bodies, central banks, statistics offices, scientific agencies, universities, AI/dev vendor documentation and more. An **official-only** mode queries them in grouped `site:` batches instead of one query per domain.
+- **Freshness** filters (day/week/month/year), automatic detection of "latest"/"today"-style queries, and a recency boost.
+- **Result fusion** by Reciprocal Rank Fusion, then ranking by trust, recency and a **relevance score weighted by term rarity within the result set** (rare query terms count more than generic ones). **Per-registrable-domain caps** (correct for multi-part suffixes such as `.co.uk` and `.go.th`) and **de-duplication of identical titles** from mirrors keep the top results diverse.
+- **Deep search:** expands the query into variants, fuses results, fetches the top pages, extracts the **most query-relevant passage** (scored by coverage and saturating frequency, weighted by term specificity, starting at a clean boundary), and assembles one numbered context. Character budget per page is **rank-weighted** (rank 1 receives the most), keeping prompts compact.
+
+**Security**
+
+- **SSRF protection:** only public addresses are allowed; private, loopback, link-local, carrier-grade NAT, multicast, unique-local and IPv4-mapped/embedded-IPv4 forms are refused, and unusual numeric IP encodings (decimal, hex, octal, short forms) are normalized before checking.
+- **Queries are guarded:** a query containing a secret or credential is **not sent** to an external engine.
+- **Fetched text is untrusted data.** It is scanned for prompt-injection phrasing in many languages, offending lines can be neutralized, secrets are masked, and content is wrapped in an explicit untrusted-content envelope whose closing tag cannot be forged in any capitalization or spacing.
+- All limits are configurable through environment variables (deadline, concurrency, pool size, keyless toggle).
+
+Inside CodeMind it is exposed as `web_search` and `deep_web_search`, the `/search` and `/search/health` endpoints, and the `search` test command.
+
+---
+
+## 20. Data Pipeline and the Offline Graph Cache
+
+### 20.1 Data connection
+
+`DataConnector` attaches to the data folder and streams training data without loading it all: line-delimited JSON, JSON, folders of source files, and paired prompt/code data. It keeps an SSD **shard cache** with a size cap and LRU pruning.
+
+### 20.2 Training plan from real data
+
+`compute_training_plan` derives the plan from the **actual measured size** of the connected data rather than assumed constants: dataset size → sample count → samples per round across the configured number of rounds (default four). The size is measured by walking the data tree with a fast directory scan, falling back to an environment-supplied estimate only when nothing is found.
+
+### 20.3 Parallel, cached parsing
+
+Parsing is deterministic CPU work. `_ParsePrefetcher` parses upcoming samples ahead of the GPU on **real separate processes** (threads would still be serialized by Python's global interpreter lock). `_GraphCache` stores parsed graphs and validator results keyed by a **content-derived sample id plus the execution-test flag**, so every round after the first reuses the work. It stores plain JSON — no pickle — because nothing in a graph is a tensor.
+
+### 20.4 Offline pre-building (`build_graph_cache.py`)
+
+Because parsing needs no GPU, the script performs it once, on ordinary CPU hardware, **before any GPU is rented**. It imports the *same* parser, worker function, validator and connector from the core module — no graph-building logic is duplicated, so a pre-built graph is byte-identical to one training would compute itself. Its properties:
+
+- **Resumable and append-only:** already-finished keys are skipped on restart, including when new training data arrives later.
+- **Crash-tolerant:** results are periodically flushed and synced; corrupt or half-written trailing lines are detected and truncated on resume; a last record that lacks its terminating newline is repaired so the next record cannot fuse with it.
+- **No duplicates:** repeated sample ids inside one input are suppressed, not written twice.
+- **Key-compatible:** the execution-test flag must match training's setting exactly, or keys will not match and the bundle will not be used.
+
+---
+
+## 21. Training Runtime and Reliability
+
+**Streaming pipeline.** Data → Parse → Graph → HGT → Loss → Backprop → Validate → PPO → Quality, reported as 0–100% progress.
+
+**Numerics and memory**
+
+- **BF16 autocast** with TF32 on Ampere/Hopper/Blackwell; `PrecisionManager` can downgrade precision under pressure but is locked during training. FP8 was removed in v76 after analysis showed it never changed what was stored or computed.
+- **Gradient checkpointing** for the brains and decoder; **`torch.compile`** on experts and bridge with a **runtime fallback**: compilation is lazy, so a failure on first real use permanently switches to eager mode for the session instead of failing every step. Compilation is skipped by default on Windows.
+- **CUDA allocator tuning** (expandable segments with split-size and garbage-collection thresholds as a fallback when expandable segments are not supported), because apparent VRAM growth in long runs was fragmentation, not a Python leak.
+- **Per-layer NaN/Inf guards** (optional) and a NaN guard on updates.
+- **Bounded RAM:** hot caches (mastery, curiosity) are bounded LRUs backed by disk; `SSDCache` spills with an LRU size cap and uses `safetensors` and JSON only.
+- Removal of hidden host–device synchronizations on hot paths (expert readiness is computed on the device).
+
+**Checkpoints and recovery**
+
+- **Single-file `.safetensors`** for the whole system plus a JSON metadata file; the dual-brain save also uses safetensors+JSON (pickle removed in v24 as an arbitrary-code-execution risk). Loaders try **`weights_only`** mode first and only fall back, with a warning, for legacy files.
+- **Rotating slots** (three) saved at a fixed step interval (every 200 steps); writes go to a temporary file and are **atomically renamed with retry/back-off**, which also covers Windows file-handle races. The small appropriateness head is saved the same way.
+- **Graceful shutdown:** `SIGTERM`/`SIGINT` set a flag checked at a safe point, triggering an orderly save instead of losing up to one interval on every restart.
+- **Preflight** (`preflight`, `preflight_report`): before a multi-hour paid run, checks the configuration against any checkpoint it is meant to resume (a changed width would otherwise fail at load and silently restart from step zero) and that there is enough disk to save.
+- **Early stopping and quality target** apply as described in §9 (every planned phase completes in dual mode).
+
+---
+
+## 22. Serving, CLI, Packaging, Security Posture
+
+### 22.1 Command line
+
+| Command | Purpose |
+|---|---|
+| `train` | Connect data and train |
+| `serve` | Start the HTTP API for IDE/web integration |
+| `project` | Recursively read and understand a whole directory |
+| `status` | Model, data and checkpoint status |
+| `cache` | View or clear the SSD shard cache |
+| `release` | Export a distributable release pack |
+| `demo` | Auto-detect + polyglot + train demonstration |
+| `calc`, `mathgen`, `mathtest` | Math engine (no model load) |
+| `langs` | Inspect human languages present in data |
+| `graphcheck` | Validate code/language graphs on real data and confirm tree-sitter availability |
+| `search` | Test the search system |
+
+Running with no subcommand prints help and concrete examples.
+
+### 22.2 HTTP API
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health`, `GET /status` | Liveness and full system status |
+| `GET /docs` | Machine-readable API description (generated from the same single endpoint table used for documentation, so they cannot disagree) |
+| `POST /generate` | Generate code (with abstention unless forced) |
+| `POST /understand` | Deep understanding of code |
+| `POST /validate` | Run the validator |
+| `POST /calc` | Deterministic math/physics |
+| `POST /search`, `GET /search/health` | Web search and its health |
+
+The server uses **one thread per request**. Inputs are type-checked (prompt must be a non-empty string; temperature must be a number in a sane range), request bodies are size-capped, and an **API key** may be required (compared in constant time). Starting a server that accepts outside connections with no API key prints a prominent warning.
+
+### 22.3 Service-side ceilings (separate from the model)
+
+`RuntimeConfig`, read from a separate JSON file at start-up, holds **serving** limits — maximum output, lines, input size, generation deadline, body size and API key. **Every limit defaults to unlimited.** This is deliberate: acceptable length is a property of *the operator's service*, not of the model, so nothing about it is baked into the weights and no code changes are needed to impose a limit. A missing or malformed file means "no limits," never a crash.
+
+### 22.4 Release pack
+
+`export_release` writes a self-contained folder: the weights (optionally down-cast to bf16 for roughly half the size) and their metadata, the **action codec** (required at inference), a **sanitized config** with machine-specific paths removed, **README / MODEL_CARD / API** documents generated from the real model at export time (never hand-written and stale), and a **manifest of SHA-256 hashes** for integrity. **No source files are included** — the pack is a model, not a codebase. `from_pretrained` loads it in one line. `export_brain_pack` produces structured context for external tools such as IDEs.
+
+### 22.5 Security posture (summary)
+
+- No pickle in caches or checkpoints; `safetensors` + JSON; `weights_only` loading.
+- Constant-time API key comparison; size-capped bodies; validated inputs; warning for open-network binds.
+- Code execution (validator) is isolated and skipped for dangerous patterns; see §25 for the operational requirement.
+- Web content is untrusted data; secrets are never sent out in queries or copied into logs; SSRF is closed.
+- Regular-expression hot paths have been audited against adversarial long inputs.
+
+---
+
+## 23. Engineering History: Real Bugs, Real Fixes
+
+These come from the source's own dated change markers, not generic lessons.
+
+**Model and training**
+
+- **Dead contrastive term (fixed).** One-pair-per-step training made the largest loss term exactly zero; a detached negative bank fixed it.
+- **Router ignored the task id (CodeMind 2).** One shared bias for every brain; now a per-brain table, which also made adding experts meaningful. It is a deliberate checkpoint-breaking change.
+- **Load-balance formulation (v87).** The old form pushed every single input toward uniform routing, working against sparse specialization; replaced with the measured-load form plus z-loss, importance loss and selection bias. Only the last router call per step used to receive auxiliary gradient; now all are averaged.
+- **Bridge anchor amnesia (v88).** Overwritten each round → now online-EWC-style decay.
+- **Collapser dangling edges (v88).** Fixed for large graphs only (small graphs never exercise chain bypass, so it stayed silent).
+- **Edge-softmax fast path never ran.** The guard matched only 1-D scores while the real caller always passed 2-D — every call silently used the slow loop. Throughput, not numbers, was affected.
+- **Eight undeclared relations (v82).** Created by builders for the file's whole life but missing from the schema, so they had no attention weights.
+- **Position table that was never trained (v82–v83)** led to long-context work: separate train/ceiling lengths, position-offset augmentation, then the move to RoPE (v88) that removes the problem.
+- **Wasted compute in long generation.** Cache rebuilt on every step after hitting the ceiling; now amortized.
+- **`max_tokens` accepted but never used (v83).** Now wired through.
+- **Inference built autograd graphs (v28.6).** Fixed with evaluation mode and no-grad.
+- **FP8 flag was a no-op (v76).** Removed; checkpoint size estimates corrected.
+- **Hidden host–device syncs (v87)** and **unbounded RAM dictionaries (v81)** removed.
+
+**Reliability and operations**
+
+- **No graceful shutdown (v64)**, **allocator fragmentation (v40, revised v45)**, **Windows compile failure handling (v48)**, **empty CLI invocation (v83)** — each fixed.
+- **Pickle in caches and checkpoints (v24)** replaced with safetensors/JSON; legacy loading guarded.
+- **Generation ceiling coupled to serving limits** — separated (§13, §22).
+
+**Hardening pass (final 2.0 candidate)**
+
+- **Quadratic-time patterns** in prompt-injection, e-mail, connection-string and graph-building pattern matching fixed, verified by adversarial-input timing.
+- **Scan-window evasion** in linguistic safety closed (head+tail scanning, `scan_clipped` flag).
+- **Untrusted-content envelope** made un-forgeable across capitalization/spacing.
+- **Offline cache:** torn-write repair and duplicate suppression.
+- **Input validation** for `/generate`; **open-bind warning** for `serve`; **`weights_only`** checkpoint loading; atomic head saves.
+- **Search ranking and budgeting:** rarity-weighted relevance, mirror-title de-duplication, rank-weighted page budgets, better passage selection.
+
+---
+
+## 24. Key Parameters
+
+*(Architecture scale. Training hyperparameters, loss weights and reward coefficients are intentionally not published.)*
+
+| Parameter | Value |
+|---|---|
+| Hidden width (all brains and decoder) | 1,664 |
+| Attention heads (brains) | 64 |
+| Brain depths | C = 16, A = 8, B = 7 HGT layers |
+| Node / relation types | 15 / 31 |
+| Registered languages | 68 |
+| Routing | 12 experts, top-3, 3 task rows, one router, one bridge |
+| Decoder | 9 layers, 16 heads, closed vocabulary ≈8,000, 8 memory-prefix tokens, RoPE |
+| Decoder context | 170,000 positions ceiling; 140,000 training length; length curriculum |
+| Collapse budget | 12,288 nodes |
+| PPO replay window | 32 |
+| Checkpoints | 3 rotating slots, every 200 steps, atomic writes |
+| Default epochs / rounds | 2 / 4 |
+| Precision | BF16 autocast, TF32 |
+| Target hardware | 1× B200 SXM (180 GB); H100 and RTX 3060 fallbacks retained |
+| **Total parameters** | **≈5.8–5.9B — architecture-arithmetic *estimate*, not a measured count** |
+
+*How the estimate is formed:* each HGT layer holds type-specific query/key/value/output matrices for 15 node types (≈166M parameters) plus relation tensors; that gives roughly 1.4B (A), 1.2B (B) and 2.7B (C), plus ≈0.3B decoder, ≈0.13B experts and smaller encoders/heads. The **authoritative** count is computed from the live model by `get_status()` and written to the release pack's model card — use that, not this table, when quoting the model's size.
+
+---
+
+## 25. Realistic Scope & Open Questions
+
+- **A solo, actively evolving system.** The dated change markers in the source show a system that has been run, broken and fixed repeatedly. That is real evidence of engineering care, but it is a different kind of evidence from an external benchmark.
+- **Internal validator scores are a strong in-distribution proxy**, because several independent checks combine multiplicatively. How that transfers to unfamiliar codebases is a separate, answerable question only external benchmarking can settle.
+- **Not yet validated end-to-end on the full CodeMind 2 configuration.** Parameter counts are estimates until measured; Brain C's contribution to code quality, and the new router/communication blocks, need ablations on real runs.
+- **Reward hacking is a bounded, real risk** in any PPO-from-a-learned-validator loop. The integrity and purity checks close the cheapest exploits; they reduce, not remove, the incentive to game the validator.
+- **Execution-based validation needs genuine sandboxing** as an operational requirement whenever enabled. Running untrusted candidate code always does.
+- **Long-context cost is real.** A 140,000-position training length is possible through linear-memory attention, but compute still grows quadratically; the curriculum mitigates, it does not remove, this.
+- **Safety is policy-driven by design.** The module will do exactly what the supplied policy says, and nothing if the policy is empty. Choosing the policy is the operator's responsibility.
+- **Search depends on configuration.** Without a keyed backend, general web search is limited to the keyless sources.
+
+The honest summary: the mechanisms here are real and were checked against the implementation; they interoperate as described. That is a stronger claim than "the architecture sounds plausible," but not the same claim as "independently benchmarked," which remains open.
+
+---
+
+## 26. Component Index
+
+| Concept | Main component(s) | File |
+|---|---|---|
+| Language table / detection | `LanguageRegistry`, `LanguageSpec` | CodeMind.py |
+| Parsers | `MultiLanguageParser`, `CPGBuilder` / `_PythonCPGBuilder`, `TreeSitterASTBuilder`, `GenericASTBuilder` | CodeMind.py |
+| Polyglot | `PolyglotProject`, `PolyglotLinker`, `MultiProjectConnector` | CodeMind.py |
+| Language graphs / detection | `build_language_graph`, `NLDetector` | CodeMind.py |
+| Encoding | `TokenEfficientEncoder`, `GraphTensorizer`, `SemanticFusion` | CodeMind.py |
+| HGT | `HGTLayer`, `HGTBrain` | CodeMind.py |
+| Multi-brain orchestration | `DualBrainOrchestrator`, `DualBrainState` | codemind_brain_dual.py |
+| Routing | `FlyPromptRouter`, `TemporalEnsembleExpert`, `ExpertCommsBlock` | codemind_brain_dual.py |
+| Bridge | `AntiForgetBridge` | codemind_brain_dual.py |
+| Collapsing | `GraphCollapser`, `CollapseStats` | codemind_brain_dual.py |
+| Generation | `GraphActionCodec`, `CodeDecoder`, `GraphRenderer`, `LargeCodeHandler` | CodeMind.py |
+| Validation | `CodeValidator`, `StaticAnalyzer`, `IntegrityChecker`, `CodePurityChecker`, `QualityEngine` | CodeMind.py |
+| Losses | `CodeMindLoss`, `LanguageMaskHead`, `LossBalancer`, `AppropriatenessHead` | CodeMind.py |
+| RL | `PPOAgent`, `CodePolicyHead`, `CuriosityPPOReward`, `RewardWeightAdapter`, `ExperienceBank`, `CuriosityMemory`, `TrustTracker` | CodeMind.py |
+| Math | `evaluate` / `calc`, exact solver, root finder, integrator, RK45, `verify_text` | CodeMind.py |
+| Data | `DataConnector`, `compute_training_plan`, `_ParsePrefetcher`, `_GraphCache` | CodeMind.py |
+| Offline cache | `build_graph_cache.py` | build_graph_cache.py |
+| Training | `TrainingPipeline`, `TrainConfig`, `PrecisionManager`, `SSDCache` | CodeMind.py |
+| Serving / packaging | `RuntimeConfig`, `ApiEndpoint`, `export_release`, `from_pretrained` | CodeMind.py |
+| Safety | `LinguisticSafety`, `SafetyPolicy`, PII/secret scanners | linguistic_safety.py |
+| Search | `SearchSystem`, backends, trust catalog, `deep_search` | search.py |
