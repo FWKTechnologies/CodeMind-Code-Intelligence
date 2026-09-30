@@ -1,263 +1,896 @@
-# CodeMind — Architecture Overview (Detailed Edition)
+# CodeMind 2.0 — Architecture Overview (Detailed Edition)
 
-**A self-hosted, multi-language code-understanding and code-generation system**
+**A self-hosted, graph-based system that understands and writes code in 68 languages and reads human language in any language — built from three specialized graph-transformer brains, a mixture-of-experts router, a two-level reinforcement-learning loop, and a set of built-in safety, math and search services. Target scale: about 6 billion parameters, trained on a single NVIDIA B200.**
 
 > **Confidentiality & IP Notice**
-> This document is grounded directly in CodeMind's real source (`CodeMind.py`, `codemind_brain_dual.py`, `build_graph_cache.py`) — every mechanism described below was checked against the actual implementation, not reconstructed from memory or assumption. To make the explanation concrete, a handful of **short, real excerpts** from the source are quoted where a mechanism is easiest to understand by seeing it directly. These excerpts are deliberately small and chosen for exposition — this document does not reproduce the files in full, does not include the training data, and does not include the trained model weights. The complete source lives in the repository linked below; treat it, not this document, as the source of truth.
+> Every mechanism in this document was checked against the real implementation (`CodeMind.py`, `codemind_brain_dual.py`, `build_graph_cache.py`, `search.py`, `linguistic_safety.py`). To protect the project's intellectual property, the document explains **what each part does, how the parts fit together, and why they were built that way** — but it deliberately contains **no source excerpts, no loss or reward coefficients, no tuned thresholds or learning rates, no regular expressions, no training data and no model weights**. Architecture-scale figures (layer counts, widths, expert counts, context lengths) are included because they are needed to understand the design. The repository, not this document, is the source of truth.
 
 ---
 
 ## License & Repository
 
-This project's real license and README already live in the repository — linking to those directly instead of restating them here, so they can never drift out of sync:
+The real license and README live in the repository; they are linked rather than restated so they cannot drift out of sync:
 
 - **Repository:** [FWKTechnologies/CodeMind-Code-Intelligence](https://github.com/FWKTechnologies/CodeMind-Code-Intelligence/tree/main)
 - **License:** [LICENSE](https://github.com/FWKTechnologies/CodeMind-Code-Intelligence/tree/main/LICENSE)
 - **README:** [README.md](https://github.com/FWKTechnologies/CodeMind-Code-Intelligence/tree/main/README.md)
 
-*(One honest caveat: I wasn't able to pull the live contents of that repository from here to confirm what's currently in the LICENSE/README — general web search didn't surface it, likely because it's very new or not yet indexed. The links above are wired up exactly as you gave them; open them yourself to confirm they resolve, and if GitHub shows a 404, double-check the org/repo spelling and that the repo is public.)*
-
 ---
 
 ## Table of Contents
 
+**Part I — The whole system**
 1. [Executive Summary](#1-executive-summary)
-2. [What CodeMind Is — and Isn't](#2-what-codemind-is--and-isnt)
-3. [System Overview](#3-system-overview)
-4. [The Graph Representation](#4-the-graph-representation)
-5. [The Heterogeneous Graph Transformer (HGT) Layer](#5-the-heterogeneous-graph-transformer-hgt-layer)
-6. [The Dual-Brain Design](#6-the-dual-brain-design)
-7. [Mixture-of-Experts Routing — Two Levels](#7-mixture-of-experts-routing--two-levels)
-8. [The Anti-Forget Bridge](#8-the-anti-forget-bridge)
-9. [Graph Collapsing](#9-graph-collapsing)
-10. [From Graph to Code: The Decoder](#10-from-graph-to-code-the-decoder)
-11. [Validation & the PPO Reward Loop](#11-validation--the-ppo-reward-loop)
-12. [Data Pipeline & the Offline Graph Cache](#12-data-pipeline--the-offline-graph-cache)
-13. [Runtime: Serving, Training, Packaging](#13-runtime-serving-training-packaging)
-14. [Engineering History: Real Bugs, Real Fixes](#14-engineering-history-real-bugs-real-fixes)
-15. [Key Parameters](#15-key-parameters)
-16. [Realistic Scope & Open Questions](#16-realistic-scope--open-questions)
+2. [The System at a Glance](#2-the-system-at-a-glance)
+3. [What CodeMind Is — and Isn't](#3-what-codemind-is--and-isnt)
+4. [Scale, Hardware and Data Sizing](#4-scale-hardware-and-data-sizing)
+
+**Part II — Understanding: from text and code to representations**
+5. [Input Side: Languages, Parsers, Language Graphs](#5-input-side-languages-parsers-language-graphs)
+6. [The Graph Schema](#6-the-graph-schema)
+7. [Encoding: Graph to Tensors](#7-encoding-graph-to-tensors)
+8. [The HGT Layer and the HGT Brain](#8-the-hgt-layer-and-the-hgt-brain)
+9. [The Three-Brain Chain (C → A → B)](#9-the-three-brain-chain-c--a--b)
+10. [Mixture-of-Experts Routing (FlyPrompt)](#10-mixture-of-experts-routing-flyprompt)
+11. [The Anti-Forget Bridge](#11-the-anti-forget-bridge)
+12. [Graph Collapsing](#12-graph-collapsing)
+
+**Part III — Generation, judgement and learning**
+13. [Generation: Codec, Decoder, Long Context](#13-generation-codec-decoder-long-context)
+14. [Validation and Quality Scoring](#14-validation-and-quality-scoring)
+15. [Supervised Learning Objectives](#15-supervised-learning-objectives)
+16. [Reinforcement Learning](#16-reinforcement-learning)
+
+**Part IV — Built-in services**
+17. [Deterministic Math and Physics Engine](#17-deterministic-math-and-physics-engine)
+18. [Linguistic Safety](#18-linguistic-safety)
+19. [Web Search Subsystem](#19-web-search-subsystem)
+
+**Part V — Running the system**
+20. [Data Pipeline and the Offline Graph Cache](#20-data-pipeline-and-the-offline-graph-cache)
+21. [Training Runtime and Reliability](#21-training-runtime-and-reliability)
+22. [Serving, CLI, Packaging, Security](#22-serving-cli-packaging-security)
+
+**Part VI — Reference**
+23. [Engineering Notes: Real Bugs, Real Fixes](#23-engineering-notes-real-bugs-real-fixes)
+24. [Key Parameters](#24-key-parameters)
+25. [Realistic Scope & Open Questions](#25-realistic-scope--open-questions)
+26. [Component Index](#26-component-index)
 
 ---
+
+# Part I — The whole system
 
 ## 1. Executive Summary
 
-CodeMind represents source code as a **typed, heterogeneous graph** rather than a flat token sequence, and reasons over that graph with two specialized transformer stacks — one tuned toward *understanding* structure, one toward *proposing edits*. A reinforcement-learning loop (PPO) rewards the system for generating outputs that pass a multi-layered, automated validator, on top of ordinary supervised training. The whole system — roughly 3.29B parameters — is designed to be trained end-to-end on a single rented GPU instance (an H100 SXM, per the current default configuration; the codebase also carries intentional fallbacks for the original RTX 3060 / Windows development machine it was prototyped on).
+CodeMind represents source code as a **typed, heterogeneous graph** — functions, calls, statements, variables, control flow, data flow, dependencies — rather than as a flat token sequence, and reasons over that graph with **Heterogeneous Graph Transformer (HGT)** stacks. Human language is handled with the *same* machinery: a sentence becomes a graph of word nodes and is read by the same kind of stack. This single-schema idea runs through the whole design: *everything flows through one graph vocabulary, whether the input is code in any language or text in any language.*
 
-This document walks through *why* each subsystem exists, grounded in the actual implementation rather than a paraphrase of it.
+The core is a chain of **three brains** that are instances of one HGT class, differing only in depth:
+
+- **Brain C** (16 layers) reads the human-language instruction.
+- **Brain A** (8 layers) reads the code graph and understands its structure, informed by what Brain C understood.
+- **Brain B** (7 layers) is the edit-oriented brain, informed by what Brain A understood.
+
+The three are connected by **one learned anti-forget bridge** and steered by **one mixture-of-experts router** (12 experts, 3 active per decision) that keeps a separate routing bias for each brain. A dedicated causal transformer, the **CodeDecoder** (9 layers, rotary positions, up to 170,000-position context), turns the fused understanding into a sequence of *structural actions* drawn from a closed vocabulary; a renderer turns those actions back into source text.
+
+Learning happens at two levels. **Supervised objectives** align instructions, code understanding and code targets, and teach the decoder by teacher forcing. A **two-level reinforcement-learning system** — a clipped-objective PPO head that learns calibrated confidence, and a true trajectory-level policy gradient on the decoder driven by a multi-layer automated validator — teaches the model to produce code that is actually valid, honest about uncertainty, and able to abstain.
+
+Around that core sit four built-in services: a **deterministic math and physics engine**, a **policy-driven linguistic-safety module**, a **web-search subsystem** engineered never to hang, leak or trust what it fetches, and a **resumable offline graph-cache builder** so that paid GPU time is never spent on parsing.
+
+The architecture arithmetic comes to **about 5.9 billion parameters**, in line with the **6-billion-parameter target**; it is sized to train on **one NVIDIA B200 SXM (180 GB)**. How large a model the training data can justify depends on the amount of data — Section 4 lays out that relationship explicitly.
 
 ---
 
-## 2. What CodeMind Is — and Isn't
+## 2. The System at a Glance
 
-| It is... | It is not... |
-|---|---|
-| A graph-based system: code becomes a typed heterogeneous graph (functions, calls, variables, control-flow, data-flow) | A large language model: there's no flat token sequence as the primary computation unit |
-| Two specialized transformer stacks (`HGTBrain` × 2 — "understand" and "edit") joined by a learned bridge | One shared stack trying to do both jobs |
-| Trained with a supervised loss **plus** a PPO reinforcement-learning loop scored by an automated validator | Trained purely by next-token prediction |
-| Generation constrained to structurally valid actions (`GraphActionCodec`), decoded by a dedicated causal transformer (`CodeDecoder`) | Free-form sampling over an open text vocabulary |
-| A fixed *parsing* front end that branches by language (native Python `ast`, tree-sitter for others, a generic fallback) | Multiple *models* — one per language. Everything past parsing shares one graph schema and one set of weights |
+### 2.1 End-to-end lifecycle
 
----
+```mermaid
+flowchart TB
+    subgraph PREP[Before any GPU is rented — CPU only]
+      D[(Training data<br/>jsonl / json / source trees / prompt-code pairs)] --> BGC[build_graph_cache.py<br/>parse · validate · content-hash]
+      BGC --> GC[(Offline graph cache<br/>append-only, resumable)]
+    end
+    subgraph TRAIN[Training on 1× B200]
+      GC --> PF[Parse prefetch workers<br/>real processes]
+      D --> PF
+      PF --> PIPE[TrainingPipeline<br/>phase C → phase A → phase B]
+      PIPE --> CK[(Checkpoints<br/>3 rotating slots · atomic writes)]
+      PIPE --> Q[QualityEngine 0–100%]
+    end
+    subgraph SERVE[After training]
+      CK --> API[serve: HTTP API]
+      CK --> REL[release: self-contained model pack]
+      API --> GEN[generate · understand · validate · calc · search]
+    end
+```
 
-## 3. System Overview
+### 2.2 Runtime data flow for one request
 
 ```mermaid
 flowchart LR
-    A[Source code / instruction] --> B[MultiLanguageParser →<br/>CPGBuilder → CodeGraph]
-    B --> C[GraphTensorizer]
-    C --> D[HGTBrain A: understand]
-    D --> E[FlyPromptRouter<br/>task_id=0]
-    E --> F[HGTBrain B: edit]
-    F --> G[FlyPromptRouter<br/>task_id=1]
-    G --> H[AntiForgetBridge]
-    H --> I[CodeDecoder →<br/>GraphActionCodec]
-    I --> J[GraphRenderer → source text]
-    I --> K[CodeValidator]
-    K -->|reward| L[CuriosityPPOReward → PPOAgent]
+    T[Instruction text] --> NLD[NLDetector] --> LG[Language graph<br/>word nodes] --> BC[Brain C]
+    S[Source code] --> P[Language-specific parser] --> CPG[Code graph<br/>AST·CFG·DFG·PDG·Call·SDG] --> COL[GraphCollapser<br/>≤ 12,288 nodes] --> BA[Brain A]
+    BC --> R1[FlyPrompt router<br/>task 2] --> BR1[Anti-forget bridge]
+    BR1 --> BA
+    BA --> R2[FlyPrompt router<br/>task 0] --> BR2[Anti-forget bridge]
+    BR2 --> BB[Brain B]
+    BB --> R3[FlyPrompt router<br/>task 1]
+    R3 --> DEC[CodeDecoder + GraphActionCodec]
+    DEC --> REN[GraphRenderer → source text]
+    DEC --> V[CodeValidator] --> AB{valid and honest?}
+    AB -- yes --> OUT[answer]
+    AB -- no --> ABS[abstain / report]
 ```
 
-Each named box above is a real class in the source, not a conceptual placeholder — `HGTBrain`, `FlyPromptRouter`, `AntiForgetBridge`, `CodeDecoder`, `GraphActionCodec`, `GraphRenderer`, `CodeValidator`, `CuriosityPPOReward`, and `PPOAgent` are all defined in `CodeMind.py` / `codemind_brain_dual.py`.
+### 2.3 The five source files
+
+| File | Role |
+|---|---|
+| `CodeMind.py` | The core: language registry, parsers, graph schema, encoder, HGT layers and brains, decoder and action codec, validator, quality engine, PPO and reward engine, loss, data connector, training pipeline, runtime config, HTTP API, CLI, release packaging, math engine |
+| `codemind_brain_dual.py` | The multi-brain machinery: FlyPrompt router, experts and expert-communication block, anti-forget bridge, graph collapser, the orchestrator that runs phases C/A/B, dual-brain persistence, dataset-size measurement |
+| `build_graph_cache.py` | Offline, CPU-only builder of parsed graphs and validator results |
+| `search.py` | The web-search and page-retrieval subsystem |
+| `linguistic_safety.py` | The policy-driven linguistic-safety, PII and secret-detection module |
 
 ---
 
-## 4. The Graph Representation
+## 3. What CodeMind Is — and Isn't
 
-`CPGBuilder` (with a Python-specific implementation, `_PythonCPGBuilder`, built directly on the standard-library `ast` module) turns source into a `CodeGraph` — a collection of typed `GraphNode`/`GraphEdge` objects merging AST, control-flow (CFG), data-flow (DFG), program-dependence (PDG), call-graph, and, for multi-file input, cross-file linkage (`PolyglotLinker`/`PolyglotProject`) into one structure.
-
-Parsing branches by language, exactly as the high-level design intends:
-
-- **Python** — native `ast`-based walk (`_PythonCPGBuilder`).
-- **Other supported languages** — `TreeSitterASTBuilder`, a tree-sitter-backed parser, when a grammar is registered for that language.
-- **Unregistered/unrecognized languages** — `GenericASTBuilder`, a line/regex-based fallback.
-
-`LanguageRegistry` resolves a language id, file extension, or content sniff to a language "family," which the polyglot linker uses to decide how aggressively to wire two files together.
-
-Once built, the graph is turned into batched tensors by `GraphTensorizer` before it ever reaches the model.
-
----
-
-## 5. The Heterogeneous Graph Transformer (HGT) Layer
-
-`HGTLayer` implements the type-specialized attention mechanism described at a high level in earlier documentation — concretely, it keeps a **separate linear projection per node type** for queries, keys, values, and output, and a **separate learned relation tensor per `(source_type, relation, dest_type)` triple**:
-
-```python
-# From HGTLayer.__init__ (CodeMind.py)
-self.w_q = nn.ModuleDict({t: nn.Linear(in_dim, out_dim) for t in ntypes})
-self.w_k = nn.ModuleDict({t: nn.Linear(in_dim, out_dim) for t in ntypes})
-self.w_v = nn.ModuleDict({t: nn.Linear(in_dim, out_dim) for t in ntypes})
-self.w_rel = nn.ParameterDict({
-    f"{s}_{r}_{t}": nn.Parameter(torch.randn(num_heads, self.head_dim, self.head_dim) * 0.02)
-    for s, r, t in etypes
-})
-```
-
-At forward time, a message traveling along a given edge type gets its key vector rotated through that edge type's own learned relation matrix before the attention score is computed (`k_src = torch.einsum("bhd, hde -> bhe", k_src, rel)`) — this is the concrete mechanism behind "a call edge and a data-flow edge are attended to differently."
-
-Two implementation details worth calling out because they were real, measured engineering decisions rather than defaults:
-
-- **A per-forward-pass key/value cache.** Since `w_k[s]`/`w_v[s]` only depend on the *source* node type, and the same source type is often reused across several relations in one forward pass, the layer memoizes those projections per call instead of recomputing them — a pure speed optimization with no effect on the numbers produced.
-- **Vectorized per-destination softmax.** `_edge_softmax` uses `scatter_reduce_`/`scatter_add_` to compute attention normalization across all edges at once, with a slower pure-Python loop kept only as a fallback for PyTorch versions that lack `scatter_reduce`. (Section 14 covers a real bug that was found and fixed in exactly this function.)
+| It is... | It is not... |
+|---|---|
+| A graph-based system: code becomes a typed heterogeneous graph; text becomes a word graph | A large language model with a flat token sequence as its primary computation unit |
+| Three stacks of **one** HGT class (language, understand, edit) joined by a learned bridge | One shared stack doing everything, or three unrelated models |
+| A system whose expert mixture operates on **one pooled vector per graph** | A token-level or node-level sparse MoE inside the transformer layers |
+| Trained by supervised objectives **and** reinforcement learning against an automated validator | Trained purely by next-token prediction |
+| A generator restricted to structurally valid actions from a closed vocabulary | A free-form sampler over an open text vocabulary |
+| Language-agnostic after parsing: one schema and one set of weights for all 68 code languages and for human text | A family of per-language models |
+| Honest about uncertainty: it can **abstain** instead of guessing | A system that always answers |
+| Policy-driven for safety: *you* define categories, weights and actions | A system with moral judgments hard-coded in source or weights |
 
 ---
 
-## 6. The Dual-Brain Design
+## 4. Scale, Hardware and Data Sizing
 
-Two `HGTBrain` instances — Brain A ("understand") and Brain B ("edit") — are trained on sequential phases (`DualBrainOrchestrator.forward_phase_a` / `forward_phase_b`) rather than jointly, on the reasoning that training one shared stack to do both jobs tends to let one skill erode the other over a long run.
+### 4.1 Target hardware
 
-```python
-# DualBrainOrchestrator.forward_phase_b (codemind_brain_dual.py)
-def forward_phase_b(self, x_dict, edge_index_dict, emb_a):
-    self.brain_b.train()
-    with self._autocast:
-        out_b = self.brain_b(x_dict, edge_index_dict)
-        sem_b = out_b.get("semantic", out_b.get("pooled"))
-        routed, routing_metrics = self.router(sem_b, task_id=1)
-        fused = self._call_bridge(emb_a.detach(), routed)
-    out_b["semantic"] = fused
-    out_b["ewc_penalty"] = self.bridge.ewc_penalty(emb_a)
-    out_b["bridge_reward"] = self.bridge.bridge_reward(emb_a.detach(), fused.detach())
-    return out_b
-```
+CodeMind 2 is sized for **one NVIDIA B200 SXM with 180 GB of HBM3e — a single GPU, not multi-GPU**. The memory budget that fixed the design is:
 
-Both brains run under `torch.autocast(dtype=torch.bfloat16)` for speed. The orchestrator additionally handles `torch.compile` for the bridge (see Section 8) with an auto-detected, platform-aware fallback — compilation is skipped by default on Windows, and if it's attempted anyway and fails the first time it actually runs (compilation is lazy), the orchestrator permanently falls back to eager mode for that session rather than erroring out repeatedly.
+- **Training state ≈ 16 bytes per parameter** (weights, gradients and the two optimizer moments). For about 6 billion parameters that is roughly **95 GB**.
+- The remaining **~80 GB** is reserved for the things that scale with *input*, not with model size: decoder activations at very long context, HGT activations over graphs of up to 12,288 nodes, the MoE and PPO buffers, and allocator overhead.
+- The decoder's memory grows **linearly** with context length because attention uses a fused flash-style kernel; this is what makes a 140,000-position training length feasible on one card.
 
----
+### 4.2 Parameter budget (target ≈ 6B)
 
-## 7. Mixture-of-Experts Routing — Two Levels
+The figures below are computed from the architecture (hidden width 1,664 everywhere) and are **estimates**; the authoritative count is computed from the live model by `get_status()` and written into the release pack's model card.
 
-The real system implements **two** routers, not one, operating at different granularities — this is more than the original high-level description captured:
-
-### 7.1 `FlyPromptRouter` — one routing decision per whole graph
-
-Pools all node embeddings into a single vector, then routes that vector through the top-2-of-6 expert mixture, biased by a per-task learned vector (`task_bias`) indexed by `task_id` (0 for Brain A, 1 for Brain B — see Section 14 for a real bug found in exactly this indexing).
-
-### 7.2 `PerNodeFlyPromptRouter` — one routing decision *per node*
-
-A newer addition (`v85` per the in-code changelog) that routes **before** pooling, while `HGTBrain.forward()` still has a per-node-type dictionary of embeddings in hand. This lets structurally different nodes in the *same* graph — a `func`/`call` node versus a `token` node — route to different experts, rather than the whole graph being forced through one routing decision. It's implemented as **dense-then-mask**: every expert runs on the full node batch in one shot, and `torch.gather` selects each node's top-k experts afterward — deliberately not a sparse dispatch, because with only 4–6 experts, running all of them is simpler and cheaper than a custom sparse-routing kernel would be at this scale.
-
-Both routers share the same underlying `TemporalEnsembleExpert` building block — a small feed-forward network with a slow exponential moving average of its own recent output blended back in (`ema_decay = 0.95`), intended to damp abrupt shifts in what an expert produces batch-to-batch. Both also compute a **load-balancing auxiliary loss**, kept attached to the autograd graph (not detached), so it actually participates in backpropagation rather than existing only as a logged statistic:
-
-```python
-# FlyPromptRouter.forward (codemind_brain_dual.py)
-if self.training:
-    mean_prob = probs.mean()
-    self._lb_loss = self._lb_coeff * (probs - mean_prob).pow(2).sum()
-```
-
----
-
-## 8. The Anti-Forget Bridge
-
-`AntiForgetBridge` connects Brain A's output into Brain B's phase and does three jobs in one small module, matching its docstring almost line for line:
-
-```python
-def forward(self, emb_a, emb_b):
-    a = self.proj_a(emb_a)
-    b = self.proj_b(emb_b)
-    cat = torch.cat([a, b], dim=-1)
-    g = self.gate(cat)
-    fused = g * a + (1 - g) * self.out(cat)
-    return self.out_norm(fused)  # normalized — stabilizes training when scales differ
-```
-
-1. **Gated fusion** — a learned sigmoid gate decides, per sample, how much of the fused output leans on Brain A's projection versus a joint projection of both.
-2. **An EWC-lite penalty** (`ewc_penalty`) — a diagonal approximation of Elastic Weight Consolidation, penalizing Brain B's output for drifting from a running anchor/importance estimate of Brain A's own embeddings, without requiring a full Fisher-information pass.
-3. **A PPO reward signal** (`bridge_reward`) — the cosine similarity between Brain A's embedding and the fused output, remapped to `[0, 1]` and smoothed with its own EMA, fed into the reinforcement-learning reward described in Section 11.
-
----
-
-## 9. Graph Collapsing
-
-`GraphCollapser` (`codemind_brain_dual.py`) shrinks a real code property graph toward a node budget (1024 nodes at the point `DualBrainOrchestrator.collapse_graph` calls it) before it reaches the tensorizer, in three passes: exact-duplicate merging (except for a protected set of structurally load-bearing node types), linear-chain bypass (collapsing `A → B → C` into `A → C` when `B` carries no independent information and isn't an "anchor" or keyword-flagged node), and, only if still over budget, degree- and keyword-weighted trimming of the lowest-importance remaining nodes. `CollapseStats` tracks nodes/edges before and after, duplicates merged, and chains collapsed, so the collapse step's behavior is inspectable rather than opaque.
-
----
-
-## 10. From Graph to Code: The Decoder
-
-`GraphActionCodec` walks a target graph's "generatable" nodes in a defined order and emits a sequence of structural actions; `GraphRenderer` turns a decoded action sequence back into formatted source text, per language family. `CodeDecoder` is the causal transformer that actually produces the action sequence, built from a stack of `_CausalBlock` layers (`_CausalSelfAttention` underneath), conditioned on the fused brain representation from Section 8, and configured via `CodeDecoderConfig`.
-
----
-
-## 11. Validation & the PPO Reward Loop
-
-`CodeValidator` layers several independent checks: `StaticAnalyzer` (language-aware where a real parser exists), `IntegrityChecker` (catching hollow stubs, prompt-echoes, and other syntactically-fine-but-substantively-empty outputs), `CodePurityChecker` (how much output is actually code versus noise), and optional real execution. The result (`ValidationResult`) feeds `CuriosityPPOReward`, which combines novelty (via `CuriosityMemory`), a `TrustTracker` weighting, a `RunningBaseline` (reward tracks *improvement*, not an absolute constant), and the bridge reward from Section 8, into the scalar reward `PPOAgent` optimizes against, using a `CodePolicyHead` and an `ExperienceBank` for replay.
-
----
-
-## 12. Data Pipeline & the Offline Graph Cache
-
-Because training sweeps the dataset more than once and parsing/validating a sample is deterministic CPU work, `build_graph_cache.py` lets that work be done once, offline, on ordinary CPU hardware, before any GPU is rented. It attaches to the exact same worker function and content-hash keying (`_GraphCache`, `_ParsePrefetcher` in `CodeMind.py`) that live training uses — so a graph produced days in advance is guaranteed byte-identical to one training would compute itself, not a re-derivation of it. The bundle it produces is a flat, resumable, append-only JSONL file; a single corrupt line is skipped rather than aborting the whole import, and results are flushed/fsynced periodically so a killed process (e.g., a reclaimed spot instance) loses minimal work.
-
----
-
-## 13. Runtime: Serving, Training, Packaging
-
-The same `CodeMind` class backs several CLI subcommands (`_build_cli_parser` in `CodeMind.py`): `train`, `serve` (an HTTP API for IDE/web integration), `project` (whole-directory analysis), `status`, `cache`, `demo`, and `release` (packaging a trained checkpoint for distribution — stripping optimizer state and machine-specific paths, optionally down-casting weights, and bundling in the codec state and auto-generated docs a recipient needs). `serve`'s runtime limits come from an external `RuntimeConfig` file, not from anything trained into the weights — a deliberate separation, discussed further in Section 14.
-
----
-
-## 14. Engineering History: Real Bugs, Real Fixes
-
-This section exists because it's the part that's easiest to fake and most valuable to keep honest — these are specific, dated fixes pulled directly from the source's own changelog comments, not generic "lessons learned" prose.
-
-- **Load-balancing loss was silently detached (fixed).** The router's docstring described an expert-collapse safeguard that, for a period, was computed and then discarded before backpropagation — meaning nothing in the gradient actually resisted collapse. It's now kept attached (see the `FlyPromptRouter.forward` excerpt in Section 7).
-- **MoE task-conditioning bug, `v84`.** `task_bias` was originally a single shared vector regardless of `task_id`, so Brain A and Brain B — despite being called with `task_id=0` and `task_id=1` respectively — were routed identically the entire time the bug existed. Fixed by making `task_bias` a `(max_tasks, num_experts)` table indexed by the real `task_id`.
-- **`_edge_softmax` vectorized path never actually ran (fixed).** An early-return condition only matched 1-D attention scores, but the real caller always passes 2-D scores (`[num_edges, num_heads]`) — so every single call silently fell through to the slow Python-loop fallback. No wrong numbers were ever produced, just a severe, silent throughput bottleneck.
-- **FP8 storage flag was a no-op (found and documented, `v76`).** A config flag implied trained weights could be stored in 8-bit precision. On inspection of `FP8Linear.forward`, the cast only happened transiently during eval-mode forward passes and was cast back before the matmul — the saved `nn.Parameter` itself was always plain float32. Checkpoint size estimates were corrected accordingly (~12 bytes/param: fp32 weight + fp32 Adam `m`,`v`), rather than leaving the wrong assumption in place.
-- **No graceful shutdown handler (fixed, `v64`).** Deploying under a process manager that sends `SIGTERM`/`SIGINT` on restart previously meant losing up to `CHECKPOINT_SAVE_INTERVAL_STEPS` (200) steps of unsaved progress on every restart. A signal handler now sets a flag checked at a safe point in the training loop, which triggers an orderly save instead.
-- **CUDA allocator fragmentation (`v40`, then corrected further in `v45`).** VRAM appeared to climb steadily during long training runs, not from a real Python-level leak, but from CUDA allocator fragmentation across differently-sized per-sample tensors. `PYTORCH_CUDA_ALLOC_CONF` with `expandable_segments:True` was set as a fix — but `v45` found, from a real user log (`"expandable_segments not supported on this platform"`), that this setting was being silently ignored on that platform, so `max_split_size_mb` and `garbage_collection_threshold` were added as a fallback that works on the native allocator too.
-- **Empty CLI invocation crashed with a confusing error (fixed, `v83`).** Running the tool with no subcommand used to fall through to a `repl` command that had been removed since `v55`, producing an opaque `argparse: invalid choice` error. It now prints help and concrete example commands instead.
-- **Generation length ceiling separated from serving limits.** The decoder's structural position-table ceiling and any operator-facing request-length limit used to be the same number, meaning every deployment was stuck with whatever ceiling training happened to use. They're now two different, independently-configurable concerns — one baked into the weights, one read from a deployment-time config file at serve start-up.
-
----
-
-## 15. Key Parameters
-
-*(Training-time configuration — see Section 13 for why these don't describe inference-time behavior.)*
-
-| Parameter | Value | Source |
+| Component | Structure | ≈ Parameters |
 |---|---|---|
-| Total parameters | ≈3.29B | Module docstring, `CodeMind.py` |
-| Checkpoint rotation | 3 rolling slots | `CHECKPOINT_ROTATE_SLOTS` |
-| Checkpoint interval | Every 200 steps | `CHECKPOINT_SAVE_INTERVAL_STEPS` |
-| Routing experts | 6 (graph-level) / 4 (per-node), top-2 active | `FlyPromptRouter` / `PerNodeFlyPromptRouter` defaults |
-| Expert EMA decay | 0.95 | `TemporalEnsembleExpert.ema_decay` |
-| Load-balance loss coefficient | 0.01 | `_lb_coeff` |
-| EWC-lite penalty weight | 0.12 | `AntiForgetBridge.ewc_lambda` |
-| Graph collapse budget | 1024 nodes | `DualBrainOrchestrator.collapse_graph` default |
-| Default training epochs | 2 | CLI default, `train`/`demo` subcommands |
-| Target hardware | H100 SXM (80 GB VRAM), 20 vCPU, 125 GB RAM — with intentional RTX 3060 / Windows fallbacks | Module docstring |
+| Brain C | 16 HGT layers | 2.75 B |
+| Brain A | 8 HGT layers | 1.40 B |
+| Brain B | 7 HGT layers | 1.24 B |
+| CodeDecoder | 9 layers, 16 heads, ≈8K closed vocabulary, 8 memory-prefix tokens | 0.34 B |
+| FlyPrompt router | 12 experts + expert-communication block | 0.16 B |
+| Anti-forget bridge | gated fusion module | 0.02 B |
+| Encoder, fusion, heads | hashed token encoder, semantic fusion, task/policy/mask heads | ≈ 0.05 B |
+| **Total** | | **≈ 5.9 B** |
+
+One HGT layer is about 168 M parameters. Almost all of it is the **per-node-type** query/key/value/output matrices (15 node types × four 1,664×1,664 matrices); the per-relation attention tensors add only ~1.3 M per layer. This is why depth is the main size lever: **each extra HGT layer costs ~0.17 B**. If a measured count ever lands off target, Brain C's depth is the first knob to turn (it is the most recent, least-proven part), then Brain B's and the decoder's.
+
+### 4.3 How the amount of data sets the model size — and the training plan
+
+Model size should follow data size. CodeMind uses a Chinchilla-style cross-check: a model of *N* parameters is well-fed by about **20 × N training tokens**, with source code averaging about **3.5 bytes per token**. Because every brain phase reads the dataset, several "effective passes" count toward the token budget. Using 2–3 effective passes as the working range:
+
+| Unique training data | Token exposures (2–3 passes) | Compute-optimal model size |
+|---|---|---|
+| 100 GB | 57–86 B | ≈ 2.9–4.3 B |
+| 140 GB | 80–120 B | ≈ 4.0–6.0 B |
+| 210 GB | 120–180 B | ≈ 6.0–9.0 B |
+| 250 GB | 143–214 B | ≈ 7.1–10.6 B |
+
+**Reading the table:** a 6B model is comfortably justified by roughly **140–210 GB of unique data** and above. With less data the model is larger than compute-optimal — it still trains, but returns diminish and overfitting risk rises, so shrink depth (Brain C first) rather than starve the model. It is a rule of thumb for the *design*, not a guarantee of quality; CodeMind's graphs are not tokens, so treat it as a planning cross-check.
+
+**The training plan is derived from the data actually connected, not from fixed constants.** The data folder's real size is measured (a fast directory scan), the sample count follows from it (an estimate of about 450,000 samples per GB applies only when a count cannot be measured), and then:
+
+- **Every brain phase reads the full connected dataset once.** With three phases (C, A, B), each sample is seen three times across a run — the data is *not* divided between phases.
+- Total sample-exposures therefore equal three times the connected sample count; the optimizer's learning-rate schedule is computed against that real total.
+- If no data is connected yet, a placeholder size is used only for reporting; it never overrides a measured size.
+- Data of any size works: a few tens of thousands of samples or a hundred million or more produce a correct plan — the plan neither clamps down to an old number nor inflates a small dataset.
 
 ---
 
-## 16. Realistic Scope & Open Questions
+# Part II — Understanding: from text and code to representations
 
-Stated plainly:
+## 5. Input Side: Languages, Parsers, Language Graphs
 
-- **This is a solo, actively-evolving system**, not a finished, externally-benchmarked product — the changelog comments throughout the source (the `v40`…`v85` markers referenced in Section 14) show a system that's been run, broken, and fixed repeatedly, which is real evidence of engineering rigor, but it's a different kind of evidence than an external benchmark result.
-- **Internal validator scores are a meaningfully strong proxy for in-distribution quality**, precisely because they combine multiple independent checks multiplicatively rather than as one lint pass — but how that translates to unfamiliar codebases outside the training distribution is a separate, open, and answerable question that only external benchmarking would settle.
-- **Reward hacking is a bounded, real risk** in any PPO-from-a-learned-validator setup — the integrity/purity checks close off the cheapest exploits, which reduces but doesn't eliminate the incentive to game the validator.
-- **Execution-based validation needs genuine sandboxing** as an operational requirement whenever it's enabled — running untrusted candidate code always does, regardless of whose pipeline it is.
+### 5.1 The language registry — 68 languages
 
-The honest summary: the mechanisms in this document are real, checked directly against the implementation, and interoperate the way they're described here — that's a different and stronger claim than "the architecture sounds plausible," but it's still not the same claim as "independently benchmarked against external tasks," which remains open.
+`LanguageRegistry` resolves a language id, a file extension or a content sniff to a **language spec** and a **language family**; the family decides how strongly the polyglot linker ties two files together. The table is open-ended — adding a language means adding a spec, not writing a parser. The current source registers **68 languages**:
+
+- **General purpose:** Python, JavaScript, TypeScript (with JSX/TSX), Java, Kotlin, Scala, C, C++, C#, Go, Rust, Swift, Objective-C, Dart, Zig, Ruby, PHP, Perl, Lua, R, Julia, Haskell, Elixir, Erlang, Clojure, F#, OCaml, Lisp, Racket, Nim, Crystal, Fortran, Ada, Pascal, VB, MATLAB, D, Groovy, Tcl
+- **Data, query and schema:** SQL, GraphQL, Protobuf, JSON, YAML, TOML, XML, Markdown, LaTeX
+- **Web and UI:** HTML, CSS, SCSS, Vue, Svelte
+- **Infrastructure, build and shell:** Dockerfile, Makefile, CMake, Terraform, HCL, Bash, PowerShell, Batch, AWK
+- **Systems and other:** Solidity, WebAssembly, Assembly, GDScript
+
+Detection from raw text scores every language against a per-language evidence table combined with cheap structural signals, and falls back to Python only when there is no evidence at all.
+
+### 5.2 Three graph builders
+
+- **Python (understanding path):** a native walk over the standard-library `ast` module builds every layer — syntax, control flow, data flow, program dependence, calls and system dependence — with real semantic analysis (definition–use chains, control dependence) rather than textual proximity.
+- **Languages with a registered grammar:** `TreeSitterASTBuilder`, backed by a real tree-sitter grammar.
+- **Everything else:** `GenericASTBuilder`, a family-aware fallback that still produces the full layered schema, so a language with no grammar installed still yields a non-empty structural signal.
+
+**Generation deliberately uses a different path.** The codec that encodes *target* code for the decoder always uses the generic builder — for every language including Python — so all languages are encoded at the same granularity (function, statement and call level) and one decoder can learn from all of them. Understanding (Brains A and B) keeps the richer builders. The two paths do different jobs and never interfere.
+
+### 5.3 Polyglot projects
+
+`PolyglotProject` and `PolyglotLinker` merge the graphs of several languages into **one** graph and add cross-language edges: API routes matched to HTTP clients, `fetch`/`require`/`import` links, shared configuration wiring, and same-family hints. `MultiProjectConnector` makes this work on real repositories: it indexes files, groups them into RAM-budgeted batches, parses batch by batch, merges through the linker and collapses before the HGT sees the result, so projects of hundreds to thousands of files never need to be resident at once (small projects take a direct fast path).
+
+### 5.4 Human-language graphs and language detection
+
+Brain C has no tokenizer or vocabulary of its own. `build_language_graph` turns text in **any** human language into a graph of `word` nodes connected by `next` (sequence) and `near` (proximity) edges, and Brain C reads it with exactly the same encoder and the same HGT class as Brains A and B.
+
+`NLDetector` identifies the human language and script of a text **without a fixed language list**: it returns a language code, a script and a confidence, and reports `und-<Script>` when the script is recognized but the language is not. It is safe to call from many threads. It is used to pick the right safety rules per message, to balance the training order across human languages where the data fits in RAM (under-represented languages are pulled forward, nothing is dropped), and by the `langs` command to inspect which human languages the training data actually contains.
+
+---
+
+## 6. The Graph Schema
+
+**15 node types**
+
+| Group | Node types | Meaning |
+|---|---|---|
+| Program layers | `ast`, `cfg`, `dfg`, `pdg`, `call`, `sdg` | Syntax, control-flow, data-flow, program-dependence, call-graph and system-dependence nodes |
+| Code structure | `func`, `block`, `expr`, `stmt`, `token` | Functions, blocks, expressions, statements, lexical tokens |
+| Polyglot markers | `lang`, `api`, `config` | Language hosts, API bindings, configuration wiring |
+| Human language | `word` | A word in a natural-language graph (Brain C) |
+
+**31 typed relations**, in families:
+
+- **Structure:** syntax child and next-sibling; function *contains* syntax; token *belongs to* syntax.
+- **Control flow:** flow and branch edges, including branch → body block.
+- **Data and dependence:** data flow; control- and data-dependence.
+- **Calls:** call *invokes* function; call *returns*; system-dependence inter-procedural edges and call-site wrapping.
+- **Cross-layer mapping:** syntax → control-flow → dependence and data-flow → dependence `maps_to` links, so information can cross layers.
+- **Polyglot:** cross-language function links; language *hosts* function/syntax; API *binds* call; configuration *wires* statement; language same-family / coexists; language *wires* configuration.
+- **Containment refinements:** expression/statement contains a call; syntax wraps statement.
+- **Language:** word `next` word; word `near` word.
+
+Every relation has **its own learned attention weights** in the HGT (Section 8). Because the model learns a different transformation per relation, a *call* edge and a *data-flow* edge are attended to differently — that is the concrete mechanism behind "typed" reasoning.
+
+---
+
+## 7. Encoding: Graph to Tensors
+
+**`TokenEfficientEncoder`** turns a node's text into a vector with no fitted vocabulary. Each token contributes a hashed-identity embedding and a bucket embedding; a projection combines them; **language** and **language-family** embeddings and a **node-type** embedding are then mixed in through small learned gates. Two order-aware additions sit on top: per-position embeddings and an **attention pooling** with a learnable query, blended in through a gate that starts almost closed, so the encoder begins near a plain average and learns how much word order matters. Because it is hash-based, it needs no fitting and works for every language — which is exactly why Brain C needs no tokenizer. Hash results are memoized, since code repeats a small set of tokens constantly, and whole batches of nodes are embedded in a single tensor operation.
+
+**`GraphTensorizer`** converts a graph into per-type feature tensors and per-relation edge-index tensors. For training it can pack many graphs into one **block-diagonal batch** with per-graph index vectors so pooling stays per graph; the single-graph inference path is unchanged.
+
+**`SemanticFusion`** combines the token-efficient encoding with the HGT output.
+
+---
+
+## 8. The HGT Layer and the HGT Brain
+
+### 8.1 `HGTLayer`
+
+The layer implements type-specialized attention (Hu et al., WWW 2020):
+
+- Every **node type** has its own query, key, value and output projections, so an `ast` node, a `call` node and a `word` node are transformed by parameters that belong to their type.
+- Every **relation** — (source type, relation, destination type) — has its own learned tensor **per attention head**. Before a score is computed, a neighbor's key is transformed through that relation's tensor.
+- Attention is normalized **per destination node** across all incoming edges; the attention-weighted messages are aggregated per destination, combined with a skip connection from the node's own input, passed through dropout and layer-normalized **per node type**.
+- The key/value projections depend only on the *source* type, which is shared across relations, so each is computed **once per forward pass** and cached — a pure speed-up with identical numbers.
+- The per-destination softmax is **fully vectorized** with scatter reductions.
+
+### 8.2 `HGTBrain`
+
+A brain is: a per-type input projection → a stack of HGT layers (with **gradient checkpointing** per layer during training) → **learnable weighted pooling** across node types → a semantic head. The pooling weights per node type start from a prior favoring functions, calls and data-flow over raw syntax and lexical tokens, but they are **trained parameters**, not constants.
+
+Each brain carries task heads on its pooled vector: *understand*, *generate*, a *validity* scalar, and a **multi-label issue head** over six categories (syntax, security, safety, undefined variable, unused import, other). The issue head is trained with real supervision from what the validator actually found, which lets `understand()` return a per-category self-check instead of a single number.
+
+All three brains share the same width (1,664) and head count (64, giving exactly 26 dimensions per head); they differ only in depth.
+
+---
+
+## 9. The Three-Brain Chain (C → A → B)
+
+### 9.1 Roles
+
+| Brain | Depth | Reads | Job | Routing task id |
+|---|---|---|---|---|
+| **C** | 16 layers | Human-language graph (the instruction) | Understand what is being asked, in any language | 2 |
+| **A** | 8 layers | Code graph (the source) | Understand code structure, informed by C | 0 |
+| **B** | 7 layers | Code graph (the target side of an edit) | Edit-oriented representation, informed by A | 1 |
+
+Brain C is deepest because its job is broadest — every human language, not one code schema. Brain B is one layer shallower than A by intent, but close enough that the anti-forget machinery stays balanced.
+
+### 9.2 What each training phase actually does
+
+```mermaid
+flowchart LR
+    subgraph PC[Phase C]
+      LG1[instruction → word graph] --> BC1[Brain C]
+      TG1[target code graph] --> BA1[Brain A as reference encoder]
+      BC1 --> R1[router · task 2]
+      BA1 --> R0[router · task 0]
+    end
+    subgraph PA[Phase A]
+      LG2[instruction → word graph] --> BC2[Brain C · no gradient]
+      BC2 --> BRG[bridge]
+      SG2[source graph] --> BA2[Brain A]
+      BA2 --> RA[router · task 0] --> BRG
+      TG2[target graph] --> BA3[Brain A + fused C]
+    end
+    subgraph PB[Phase B]
+      LG3[instruction → word graph] --> BC3[Brain C · no gradient]
+      SG3[source graph] --> BA4[Brain A + fused C]
+      BA4 --> BRG2[bridge] --> BB4[Brain B]
+      TG3[target graph] --> BB4
+      BB4 --> RB[router · task 1]
+    end
+```
+
+- **Phase C.** The instruction becomes a word graph and is read by Brain C; its embedding passes through the router with task id 2. The code target is encoded by Brain A as the reference embedding. Two language-only objectives (Section 9.4) are active in this phase.
+- **Phase A.** Brain C runs **without gradient** as a feature source; its embedding is fused with Brain A's routed output through the bridge. Both the source graph and the target graph go through Brain A.
+- **Phase B.** Brain C again runs without gradient; Brain A (with Brain C's embedding fused) encodes the source; its embedding is fused into Brain B's routed output through the same bridge; Brain B encodes the target. The anti-forget penalty (Section 11) is active in this phase.
+
+**There is no hard freezing between phases.** All modules live in **one optimizer** with one warm-up-then-cosine learning-rate schedule computed over the whole run, and a phase simply decides *which brain's data path is exercised*. Brain C is a gradient-free feature source in Phases A and B; Brain A keeps participating in Phase B while the bridge's anchor and penalty protect what it learned. Each fusion uses the **actual embedding produced for that very sample** (detached from the upstream brain), while a separate slowly-moving **anchor** exists only for the forgetting penalty.
+
+**Why sequential phases rather than joint training.** Training one stack for several jobs at once tends to let one skill erode another over a long run. Sequential emphasis, with an anchor from each finished phase, lets each brain specialize while staying connected.
+
+**Every planned phase always runs.** Validation quality of one phase is not comparable with the next, because each phase exercises a different brain. A quality-target or patience stop reached at the end of a phase is therefore logged, the patience counter is reset, and the next phase still runs. (The single-epoch mode keeps the classic early stop.)
+
+### 9.3 Replay and anchors
+
+The orchestrator keeps two small replay buffers — one of language embeddings (from Phase C) and one of code embeddings (from Phases A and B), 256 entries each, oldest dropped first. When Phase C ends, the anchor is initialized from the most recent language embeddings; when Phase A ends, it is **blended** with the most recent code embeddings (Section 11 explains why blending, not overwriting).
+
+### 9.4 Brain C's language-specific objectives
+
+- **Masked-word feature objective (`LanguageMaskHead`).** Without it, Brain C would learn only the properties of a prompt that help predict a code embedding. A fraction of the words in each prompt are hidden behind a mask vector, and Brain C must recover the **input features** of the hidden words from their context. It needs no per-language vocabulary, works for every language the encoder handles, and **reuses the same forward pass** as the main loss — no extra pass. Its weight is moderate, so code remains the primary goal.
+- **`LossBalancer`.** The language term is kept at a target *share* of the total loss by adapting its weight to the measured loss sizes (smoothed, bounded, with a warm-up period). Balancing by loss magnitude stands in for balancing by gradient, at no extra backward cost.
+- **`AppropriatenessHead`.** A very small classifier on Brain C's **detached** embedding predicting two independent axes: *severity* (how much care the content needs) and *casualness* (register). No gradient flows from it into any brain, so it cannot distort the main architecture; its weights travel in the same model file as everything else, and a checkpoint without it simply starts the head from random values.
+
+The language brain can be disabled, in which case the chain reduces to two phases (A → B) — meant for starting a fresh, smaller model, not for resuming a three-brain checkpoint.
+
+---
+
+## 10. Mixture-of-Experts Routing (FlyPrompt)
+
+### 10.1 What kind of MoE this is
+
+The mixture-of-experts in CodeMind is a **representation mixer applied once per graph, after a brain has pooled its output** — not a sparse feed-forward layer inside the transformer stack. A brain produces one semantic vector for the whole graph; the FlyPrompt router chooses **3 of 12** experts for that vector; the chosen experts transform it; and the mixed result *replaces* the brain's semantic vector on its way to the bridge and decoder. One router instance serves all three brains.
+
+```mermaid
+flowchart TB
+    X[pooled semantic vector<br/>from a brain] --> N[pre-norm]
+    N --> G[gate: one score per expert]
+    TB[task-bias row<br/>C = 2 · A = 0 · B = 1] --> G
+    G --> NS[+ training noise]
+    NS --> SM[softmax over 12 experts]
+    SM --> SEL[select top-3<br/>training: bias-adjusted ranking]
+    RB[auxiliary-loss-free<br/>selection bias] --> SEL
+    SEL --> RW[mixing weights = true gate probabilities<br/>renormalized over the 3 chosen]
+    X --> E[3 chosen experts run<br/>sparse execution]
+    SEL --> E
+    E --> COM[Expert-communication block<br/>self-attention over the 3 outputs]
+    COM --> MIX[weighted sum]
+    RW --> MIX
+    MIX --> OUT[routed vector → bridge]
+```
+
+### 10.2 Routing algorithm, step by step
+
+1. **Pool and normalize.** The input is averaged to a single vector and layer-normalized so gate logits stay stable at this width.
+2. **Score with task conditioning.** A linear gate scores the 12 experts; a **learned per-task bias row** is added. The bias table has **three rows** — one per brain — and is indexed by the real task id, so Brain C, Brain A and Brain B learn *different* expert preferences. The table starts at zero, so all three begin identically and diverge only as training pushes them apart. An out-of-range task id is clamped rather than raising an error.
+3. **Explore.** During training, small Gaussian noise is added to the logits.
+4. **Select.** The 3 highest-scoring experts are chosen. **In training, selection uses the gate probabilities plus a small balancing bias** (below); at evaluation it follows the gate alone.
+5. **Mix.** The mixing weights come from the **true gate probabilities** of the chosen experts (the selection bias is *not* included, so it cannot distort outputs) and are **renormalized to sum to one** — so the output scale does not shrink as experts are added.
+6. **Execute sparsely, let them talk, combine.** Only the 3 chosen experts run. Their outputs pass through the expert-communication block, then are combined with the mixing weights.
+
+### 10.3 The experts
+
+Each of the 12 experts is a pre-normalized two-layer feed-forward network with an inner layer twice the model width, an inner layer norm and GELU (about 11 M parameters each). Each expert also carries a **temporal ensemble**: a slowly-moving exponential average of its own recent outputs, updated during training from the batch-mean output, and blended back into its output with a small weight once it is available. The effect is to damp abrupt batch-to-batch swings in what an expert produces and to help it retain older patterns. The "is the average ready yet" check is computed on the device, so there is no hidden host–device synchronization on this hot path.
+
+### 10.4 The expert-communication block
+
+Without it, the selected experts would process the same input in isolation and meet only at the final weighted sum. The communication block treats the 3 selected outputs as a **tiny sequence whose tokens are experts**: one pre-norm self-attention layer (8 heads) followed by a small feed-forward layer mixes information across them, each through a **gated residual whose gate starts almost closed** (not fully closed, so gradient reaches the block from the start) and opens only if training finds the conversation useful. Early behaviour therefore stays close to a plain weighted sum, and the block is a no-op when only one expert is selected. Attention runs in full precision inside this block for stability.
+
+### 10.5 Four mechanisms against expert collapse
+
+A router that sends everything to a few experts wastes the rest. Four cooperating mechanisms prevent it:
+
+1. **Load-balance loss (Switch-Transformer form).** Built from *measured* expert load — a running average across many routing calls — multiplied by the gate's own probabilities, so the gradient pushes down probability on over-loaded experts. (A per-call "make every probability equal" penalty would fight sparse specialization; this form does not.)
+2. **Router z-loss.** Penalizes large gate logits so the softmax cannot saturate — the classic cause of unstable routing and NaNs in long MoE runs.
+3. **Importance loss.** Load counts *how often* an expert is chosen; importance measures *how much total gate mass* it receives. An expert chosen rarely but always with a large weight (or the reverse) is invisible to load alone. This term penalizes the spread of importance.
+4. **Auxiliary-loss-free selection bias.** During training a small, bounded bias nudges *selection* (never the mixing weights) toward under-used experts — so an expert that has fallen out of use is not abandoned permanently, and no extra loss term pushes against the main objective.
+
+**Aux-loss bookkeeping.** One router serves three tasks and, in batch mode, is called once per graph. Every call that has gradient contributes its auxiliary loss to a list; the training step **averages all of them once per step**, so every task and every graph in the batch receives balancing gradient (an earlier design that kept only the last call starved the others). The three routing statistics (load, importance, selection bias) are runtime state, not checkpointed — they rebuild within a short stretch of training after a resume — while the experts' temporal averages *are* saved.
+
+### 10.6 Diagnostics
+
+Every routing call reports routing entropy, the maximum expert load (near one-twelfth means balanced; near 1.0 means collapse), the balance and z-loss values, and which experts were chosen. These flow into the training log so collapse is visible early.
+
+### 10.7 Execution details
+
+The router runs eagerly by design: its expert selection depends on tensor values, which would force compiler graph breaks on every call. The bridge, which is pure matrix arithmetic, is compiled instead; if compilation fails on first real use it permanently falls back to eager execution without failing the run. In batch mode the brains run batched, while the router is called once per graph in a loop (pooling per graph has already happened inside the brain), so results per graph equal what single-graph routing would produce.
+
+---
+
+## 11. The Anti-Forget Bridge
+
+One `AntiForgetBridge` joins **both** hand-offs — C → A and A → B — and does three jobs:
+
+1. **Gated fusion.** Upstream and downstream vectors are each projected; a learned sigmoid gate decides, per sample, how much of the result leans on the upstream brain versus a joint projection of both; a final layer norm keeps scales comparable when the two sides differ.
+2. **An EWC-lite penalty.** A diagonal, Fisher-style approximation of Elastic Weight Consolidation penalizes the upstream embedding for drifting away from a stored anchor, weighted per dimension by how much each dimension mattered — without a full Fisher pass. In the pipeline it is active in **Phase B**, scaled down and capped relative to the main loss so it can regularize but never dominate.
+3. **A bridge reward.** The cosine similarity between the upstream embedding and the fused output, mapped to [0, 1] and smoothed. High values mean upstream knowledge survived fusion; very low values mean drift. It feeds the PPO reward through the feedback-learning path (Section 16.6).
+
+**Anchor maintenance — online-EWC style.** At the end of the C phase and again at the end of the A phase, the anchor and per-dimension importance are updated from the recent replay embeddings. They are **blended with exponential decay** (mostly history, partly the latest) rather than overwritten, so after several phases and rounds the anchor still carries traces of earlier learning instead of protecting only the most recent stretch. The very first update initializes directly.
+
+---
+
+## 12. Graph Collapsing
+
+`GraphCollapser` shrinks a graph toward the node budget before the HGT sees it. The budget in training and serving is the configured **`max_nodes` = 12,288**; graphs already under it are returned untouched. Stages:
+
+1. **Exact-duplicate merge** by node type and label, in linear time, except for a protected set of structurally load-bearing types.
+2. **Edge remap and de-duplication** after the merge.
+3. **Linear-chain bypass:** a low-importance node with exactly one predecessor and one successor is bypassed (A → B → C becomes A → C) unless it is an *anchor* type (function, call, data-flow, system-dependence) or carries an entry-point-like name (main, init, handler, router, …). Dangling edges left by the bypass are cleaned up.
+4. **Importance trimming**, only if still over budget, using degree, type and keyword weights. Entry, call and data-flow structure is never cut.
+
+`CollapseStats` records nodes and edges before and after, duplicates merged and chains collapsed, so the step is inspectable. The budget is a trade-off: a larger budget loses less structure at roughly *linear* extra memory (unlike the decoder's context, which costs quadratic compute).
+
+---
+
+# Part III — Generation, judgement and learning
+
+## 13. Generation: Codec, Decoder, Long Context
+
+### 13.1 The action codec
+
+`GraphActionCodec` is the single codec for the whole system. It walks a target graph's *generatable* nodes in a defined order and emits a sequence of **structural actions** from a **closed vocabulary** of about 8,000 entries (line-level labels for functions, statements and calls plus structural markers). The vocabulary is fitted once from your own corpus (`fit_generator_tokenizer`) and saved as `gen_codec.json`, a required companion to the weights. `GraphRenderer` turns an action sequence back into formatted source text per language family.
+
+The trade-off is stated plainly: because no language is special-cased on this path, there is no guarantee-by-construction of syntax validity such as a language's own unparser would give. One decoder learning from all 68 languages, disciplined by the validator and the RL loop, is the intended alternative.
+
+### 13.2 The decoder
+
+`CodeDecoder` is a decoder-only transformer — 9 layers, 16 heads, width matching the brains — in which every step depends on what has actually been generated. The fused brain embedding is injected as **eight memory-prefix tokens** that every position can attend to, so generation is conditioned on the graph itself, not on metadata appended to a prompt. The output embedding and the output projection share weights.
+
+- **Positions:** rotary position embeddings (RoPE). If inference meets a length beyond what was trained, a minimal automatic scaling is applied instead of failing; that is graceful degradation, not a recommended mode.
+- **Long context:** a **170,000-position ceiling** and a **140,000-position training length**, reached through a **length curriculum** — training starts near 4,096 positions and rises over the first quarter of the run, so the most expensive lengths are not forced when they help least. A small fraction of samples are assembled as deliberately long contexts, and positional-offset augmentation exposes the model to varied absolute positions. Memory is linear in length (fused flash-style attention); compute is still quadratic, an accepted cost.
+- **Structural ceiling vs. service limit.** The position ceiling belongs to the weights. Any operator-facing output limit lives in a separate runtime config (Section 22.3) and defaults to unlimited; natural stopping comes from the model's end signal and a repeat-cycle guard.
+- **Incremental decoding.** Generation reuses cached keys and values. If the context reaches the ceiling, the window slides and the cache is rebuilt with slack, so the rebuild happens once every several steps instead of every step.
+
+### 13.3 Decoding behaviour
+
+The production decoder is **deterministic greedy** with an anti-cycle guard that blocks repeating patterns. A temperature divides the logits before the argmax, which cannot change which action wins — repeated calls return the same answer, which is right for one final answer but would make naive best-of-N produce N identical candidates. CodeMind therefore provides:
+
+- **`generate_rl`** — a genuinely stochastic, gradient-tracking sampler used by reinforcement learning (Section 16.2).
+- **`generate_best_of`** — draws diverse candidates and **re-ranks them with the validator**, for callers who want to spend more compute on one final answer.
+- **Abstention** — if validation says the output is unsafe to ship (a cheating pattern, hollow code that does not run, demonstrably wrong behaviour, too many errors), `generate()` **abstains** unless the caller passes `force`. A request-level output limit, when supplied, is honoured per call.
+
+### 13.4 Large code
+
+`LargeCodeHandler` edits or generates code from 10,000 to 500,000+ lines by chunking at function and class boundaries (never mid-function), processing chunk by chunk, carrying a **semantic context embedding** from one chunk to the next in addition to textual tail context, and stitching outputs back with indentation preserved. It streams, so the whole file is never resident at once.
+
+---
+
+## 14. Validation and Quality Scoring
+
+`CodeValidator` layers independent checks, combined so a single failure cannot be hidden by strength elsewhere:
+
+1. **`StaticAnalyzer`** — language-aware syntax, undefined names and unused imports where a real parser exists, plus a **safety** check for dangerous constructs (careful but non-blocking, so learning is not stopped).
+2. **`IntegrityChecker`** — catches *cheating*: hollow stubs, prompt echoes, prose mixed with code.
+3. **`CodePurityChecker`** — how much of the output is actually code versus noise.
+4. **Optional execution** — for Python, in an isolated subprocess, skipped automatically when a dangerous pattern was found. When a reference is supplied, a behaviour comparison checks that the code is *behaviourally right*, not merely that it ran.
+5. **Structural similarity** — with a reference graph, a data-flow / control-flow similarity check works **without execution**, for any language.
+6. **Project validation** — `validate_project` scores a polyglot project file by file against each file's own language rules.
+
+The result (`ValidationResult`) carries validity, a score in [-1, 1], issues, feedback, execution status, integrity, safety, purity, a cheating flag, abstain advice and — when evidence exists — a logic score and behaviour match.
+
+**`QualityEngine`** turns this into a 0–100 **model quality** score along six dimensions — syntax, static checks, graph coverage, semantic similarity, execution, and *mastery* (how well the model already knows this kind of code). It is deliberately multi-dimensional: a low loss with hollow outputs should not look like quality. `run_quality_audit` and `verify_ai_spec` self-check the loss/quality pipeline and confirm the system matches its intended specification, before or after training.
+
+---
+
+## 15. Supervised Learning Objectives
+
+`CodeMindLoss` combines six objectives:
+
+- **Contrastive alignment** between source and target embeddings. Because training processes one (source, target) pair per step, the similarity matrix would be 1×1 and its softmax trivially one; a small **bank of recent target embeddings** supplies genuine negatives at almost no cost.
+- **Semantic** objective on the fused understanding.
+- **Validity** prediction against the validator.
+- **Graph-structure** objective.
+- **Policy** term, reporting the PPO head's loss.
+- **Issue-type** multi-label objective trained from real validator findings.
+
+Phase-specific terms are added on top: the capped anti-forget penalty (Phase B), the router's step-averaged balancing loss (all phases), Brain C's masked-word and appropriateness objectives (Phase C). The **decoder is trained inline** with the main step, from the source embedding already computed, using teacher-forced cross-entropy — no second forward pass and no separate decoder stage. Gradient accumulation gives an effective batch of roughly a thousand samples per optimizer update.
+
+---
+
+## 16. Reinforcement Learning
+
+### 16.1 Two levels, two jobs
+
+CodeMind's RL is deliberately split, because one mechanism cannot do both jobs well:
+
+```mermaid
+flowchart TB
+    subgraph L1[Level 1 — Policy head · clipped-objective PPO]
+      S1[state: source understanding] --> PH[CodePolicyHead<br/>actor · critic · confidence]
+      A1[action: embedding of the target code] --> PH
+      VR1[validator result on the training target] --> RE[Reward engine]
+      RE --> PPO1[PPOAgent update<br/>buffered · minibatched · KL-anchored]
+      PPO1 --> PH
+      PH --> CONF[calibrated confidence → abstention]
+    end
+    subgraph L2[Level 2 — Decoder trajectory policy gradient]
+      SRC[source] --> U[understand · no grad]
+      U --> EMB[embedding]
+      EMB --> RO[stochastic rollout of the decoder<br/>KV-cached · grad-tracked]
+      RO --> CODE[generated code]
+      CODE --> VAL[CodeValidator] --> RE2[Reward engine + issue-fix bonus]
+      RE2 --> PG[policy-gradient step on decoder weights]
+    end
+```
+
+| | Level 1 — policy head | Level 2 — decoder RL |
+|---|---|---|
+| Nature | Single-step (contextual bandit) on the pooled understanding | Sequential decisions: each generated action is one step of a genuine MDP |
+| What it trains | The small `CodePolicyHead` (actor, critic, confidence) | The **decoder's own weights** |
+| Reward source | Validator result on the **training target**, through the reward engine | Validator result on the **model's own generation**, through the same reward engine |
+| Main purpose | **Calibrated confidence** — knowing when to abstain | **Behaviour shaping** — producing code that validates, which cross-entropy cannot teach |
+| Cadence | Buffered; updates when the replay buffer is full | Every few training steps (configurable by environment variable) |
+
+### 16.2 Level 2 — decoder trajectory RL
+
+Teacher-forced cross-entropy teaches the decoder to imitate the next action of a target. It can never teach "the code I generated on my own actually works", because that signal is a non-differentiable outcome at the end of a whole generation. Policy gradient exists for exactly that.
+
+Every few steps the training loop performs one **rollout**:
+
+1. `understand()` embeds the source (inference mode — so this step trains the **decoder only** and does not reach back into the brains).
+2. The decoder **samples** a full action sequence stochastically, with the anti-cycle guard applied as a probability mask rather than hard removal. Sampling is capped per rollout (256 actions) to bound cost, and uses the same **grad-enabled KV-cache** as inference — so rollout is linear, not quadratic, in length, and inference and training share one compute path.
+3. If the structure breaks (the rollout hit its cap before a proper end), the sample still yields a **negative reward** — a bad rollout teaches as much as a good one, so it is not discarded.
+4. Otherwise the generated code goes through the full `CodeValidator`. With the execution-test flag on, the code is compared against the training target's **real behaviour** and **data-flow/control-flow structure**, so `sorted(x)` and `sorted(x, reverse=True)` no longer earn the same reward merely because both run.
+5. The reward engine scores it, and an **issue-fix bonus** is added in proportion to how many of the source's statically detected issues the generated code no longer has — tying *detection* and *repair* to a single signal.
+6. The advantage is the reward minus a **running baseline** (a single smoothed scalar — no extra value network, no extra parameters). The update is the **sum of the trajectory's log-probabilities times the advantage**, with gradient clipping, through the decoder's own optimizer and scheduler.
+
+Because each rollout is used for exactly one on-policy update, the importance ratio is exactly one, so a clipped surrogate would add nothing; the level-2 update is therefore a baseline-subtracted policy gradient rather than clipped PPO. The whole step is wrapped so that any failure is logged once and never interrupts the main training step, and a rolling trend (average, worst, best reward) is logged so improvement can be seen despite the high variance of single rollouts.
+
+### 16.3 Level 1 — the policy head and its PPO machinery
+
+The policy head works on the pooled understanding of the source as its **state**, with an **action** defined by the encoder's embedding of the target code, projected onto a 1,024-way discrete action space. It has three outputs: an **actor** (action log-probabilities), a **critic** (value), and a **confidence head** whose output is explicitly trained to match reality rather than to be optimistic. Because each sample is a complete one-step episode, generalized advantage estimation collapses to *reward minus value*. The agent is best understood as learning **calibrated confidence and value**, with real PPO mechanics; behaviour shaping belongs to Level 2.
+
+The PPO machinery, in full, without its coefficients:
+
+- **Buffered updates.** Experiences accumulate until the buffer is full enough; single-sample updates are too noisy. A final flush handles the tail at the end of a pass.
+- **Reward normalization.** Rewards are standardized with a running (Welford-style, group-merged) mean and variance that persists across updates, then clipped to a bounded range.
+- **Advantages** are computed with GAE and standardized within the batch.
+- **Minibatched epochs** with a fresh shuffle each epoch — **clipped surrogate objective** for the policy, a **clipped value loss** for the critic, and an **entropy bonus** that is annealed from its starting value down to a small **non-zero floor** (so the policy never collapses into brittle determinism).
+- **KL anchoring.** A frozen **reference copy** of the policy is kept; a KL penalty toward it is added, and **its coefficient adapts automatically** — raised when the policy drifts beyond a target and lowered when it is too tightly held.
+- **Early stopping** of the update epochs when the policy moves too far from the behaviour policy within one update.
+- **Stability:** gradient clipping, automatic skipping of any non-finite step, a learning-rate warm-up followed by cosine decay with restarts, and mixed-precision execution through the shared precision manager.
+- **Diagnostics** are reported with every update: loss components, approximate KL to the old and the reference policy, clip fraction, explained variance of the critic, current KL coefficient, entropy coefficient, learning rate, and the latest reward breakdown.
+
+**Confidence and abstention.** The confidence head is what makes *"not confident, so don't answer instead of cheating"* an actual mechanism. Abstention is governed by both the confidence head and the validator's own advice (Section 13.3).
+
+### 16.4 The reward engine
+
+`CuriosityPPOReward` assembles the reward from separate, visible dimensions, each of which appears in the logs:
+
+| Dimension | What it rewards or penalizes |
+|---|---|
+| **Correctness** | The validator's score, mapped to [0, 1]; the largest primary term |
+| **Curiosity** | Novelty of the input, scaled by integrity so that novelty of garbage earns nothing |
+| **Calibration** | Confidence should match reality: over-confidence is penalized in proportion to the gap, appropriate humility is rewarded |
+| **Honesty** | Abstaining when invalid is rewarded; cheating is penalized heavily; valid, non-abstained output earns a little |
+| **Integrity** | Real code, no hollow stubs, no prose; an additional penalty when cheating is detected |
+| **Safety** | How safe the code is |
+| **Logic** | Real behavioural or structural evidence of correctness — zero when no reference exists to compare against |
+| **Bridge retention** | Upstream knowledge surviving fusion (small bonus or penalty, only at the extremes) |
+| **Linguistic safety** | *Auxiliary.* A small penalty proportional to the severity of the text's content |
+| **Conversational register** | *Auxiliary.* A very small bonus for natural, casual register |
+| **Math correctness** | *Auxiliary.* Arithmetic claims of the form "expression = value" in the output are recomputed by the math engine; correct claims earn a little, wrong ones cost a little |
+
+The total is **clamped to a bounded range** so no single term can run away. **Primary terms dominate by design; the three auxiliary terms are deliberately small.** Separately, a **trust score** (0–100, `TrustTracker`) moves with outcomes — confident errors and cheating cost a lot, valid high-integrity output earns, calibrated abstention earns a little — and feeds back into the logs and behaviour.
+
+### 16.5 Keeping the reward honest
+
+A learned reward is an invitation to be gamed, so three safeguards are built in:
+
+- **`RewardWeightAdapter`** tunes *only* the three auxiliary terms (curiosity, math, linguistic/register), each within a hard range, smoothly, every few hundred samples, using **real measurements that do not pass through the reward itself**: the validator pass rate, the measured rate of wrong arithmetic claims, and the measured severity rate of text. It never touches correctness, honesty, integrity, safety, logic or the cheating penalty.
+- **Hack detector.** If the average reward climbs while the *real* validator pass rate does not move, the adapter pulls every multiplier back toward neutral and raises a `hack_suspect` flag that appears in the PPO metrics.
+- **Why the weights are not learned by gradient.** Letting the policy learn its own reward weights would teach it to find shortcuts to high reward; fixed primaries plus measured, bounded auxiliaries closes that door.
+
+Curiosity itself is backed by `CuriosityMemory`, a hashed memory of patterns already seen (bounded, persisted on disk); an input is only marked "seen" when its integrity was acceptable.
+
+### 16.6 Mastery, skipping, and where the bridge reward enters
+
+`ExperienceBank` remembers how well each kind of code is already mastered. A bounded, least-recently-used hot cache in RAM sits in front of a persistent on-disk store, so the memory stays flat over very long runs. Training can **skip re-learning mastered code** and **prioritize low-mastery samples**.
+
+The **bridge reward** reaches the PPO reward through the feedback-learning path (`train_from_feedback`: validate → curiosity reward → calibration → trust update → PPO). In the main training step the bridge term is left neutral, and the bridge's effect there comes through the fusion itself and the anti-forget penalty instead.
+
+---
+
+# Part IV — Built-in services
+
+## 17. Deterministic Math and Physics Engine
+
+Language models do arithmetic unreliably, so CodeMind carries an exact engine that needs no model to run. It performs **unit-aware calculation** — values are stored in SI units with dimensional analysis, and mismatched dimensions are errors, not silently wrong numbers — and includes:
+
+- a safe expression evaluator producing quantities with units, with optional conversion of the result;
+- **exact rational linear-system solving** (Gauss–Jordan with pivoting, on fractions);
+- root finding that requires a bracketing sign change;
+- adaptive numerical integration of smooth functions;
+- numerical derivatives with extrapolation for higher accuracy;
+- an adaptive Runge–Kutta integrator for simple physical simulation (springs, orbits, …);
+- a **text verifier** that scans "expression = number" statements in generated text, recomputes them and reports a verdict — the source of the math reward term in Section 16.4;
+- **training-data generators** whose answers are checked by the engine itself.
+
+It is exposed as the `/calc` endpoint and the `calc`, `mathgen` and `mathtest` commands.
+
+---
+
+## 18. Linguistic Safety
+
+The module's founding principle: **there is no fixed, built-in definition of "right" and "wrong" in the source.** Category names, weights, thresholds and actions (block, flag, ignore) come from **your own policy file**; wordlists shipped in the source are only mild examples. The code provides the *mechanism*, not the judgment. The mechanism is engineered against concrete failure modes:
+
+- **Word-boundary matching** for space-delimited scripts, so short risky strings do not match inside innocent words or code identifiers, with combining marks of Indic, Thai and Arabic scripts counted as part of the word. **Substring matching plus an editable "safe words" list** for scripts written without spaces (Thai, Chinese, Japanese, Lao, Khmer, Burmese), so ordinary words that merely contain a risky fragment are not blocked.
+- **Targeted obfuscation handling:** digit-for-letter substitution is undone only inside tokens that mix letters and digits (so version numbers and laughter such as "555" are not mangled); repeated-letter stretching; separator tricks; invisible characters (zero-width, bidirectional controls, tag characters); look-alike Cyrillic/Greek letters inside Latin words; stacked combining marks used as noise — all without damaging scripts where combining marks carry meaning.
+- **Sarcasm markers** can lower a *severity score* used by the reward but **cannot unblock** a message unless your policy explicitly allows it, so appending "just kidding" cannot launder content.
+- **A threshold of zero means "block immediately"**, not "unset".
+- **PII and secret detection with real validation:** checksums (Luhn, the Thai national-ID check digit, IBAN mod-97) replace naive digit counting, so timestamps and order numbers are not reported as card numbers. Secret detection covers common cloud, API, token and connection-string formats and high-entropy strings. **Reports store only masked values**, so a secret is never copied into a log.
+- **Multi-language analysis:** code-switched text is checked against its primary and secondary languages; unknown languages are checked against every available wordlist; codes such as `zh-CN` and `th_TH` are accepted.
+- **Performance and robustness:** wordlists compile to cached per-language matchers; PII is scanned **once** per message and shared between redaction and reporting; repeated reward-side analysis of the same text is memoized; redaction is linear-time; e-mail and connection-string patterns are length-bounded so adversarial inputs cannot cause quadratic slowdowns. Over-long messages are analysed at both head and tail — where content is usually hidden — and flagged `scan_clipped`, so the caller can choose to reject abnormal lengths.
+
+Inside CodeMind this module contributes only **small auxiliary reward terms** (severity and register) and feeds the appropriateness head's training; it never decides whether code is valid — that is the validator's job.
+
+---
+
+## 19. Web Search Subsystem
+
+`search.py` provides search and page retrieval with one priority above all: **never hang, never stall the server, never leak, never trust.**
+
+**Reliability**
+
+- One shared worker pool and a **per-request overall deadline**; when time runs out the system returns what it has, and it returns immediately once the primary backend answers, waiting only briefly for the others.
+- HTTP calls have a true **total-time ceiling**, not just a per-read timeout, so a server dripping bytes cannot stall a worker.
+- **Circuit breakers** in half-open mode (one probe at a time); rate-limit and authentication responses are handled at once without retry storms.
+- **Single-flight** for identical concurrent queries (one backend call) and a **cap on concurrent searches** instead of an unbounded queue.
+- A **cache with stale-if-error** (if a backend is down, answers up to a day old are served rather than nothing), debounced disk writes from a separate thread, and thread-local status.
+
+**Search quality**
+
+- **Backends.** Keyless: Wikipedia, StackExchange, arXiv, PubMed, GitHub (chosen by query category). Optional keyed: Brave, SearXNG, Google Custom Search, SerpAPI. Without a keyed backend, general web search is limited to the keyless sources.
+- A curated **catalog of roughly 590 official and reputable domains** worldwide — governments, international bodies, central banks, statistics offices, scientific agencies, universities, AI and developer documentation, and more. An **official-only** mode queries them in grouped `site:` batches rather than one query per domain.
+- **Freshness** filters (day, week, month, year), automatic detection of "latest"/"today"-style queries, and a recency boost.
+- **Result fusion** by Reciprocal Rank Fusion, then ranking by trust, recency and a **relevance score weighted by term rarity within the result set** (rare query terms count more than generic ones). **Per-registrable-domain caps** (correct for multi-part suffixes such as `.co.uk` and `.go.th`) and **de-duplication of identical titles** from mirrors keep the top results diverse.
+- **Deep search:** expands the query into variants, fuses results, fetches the top pages, extracts the **most query-relevant passage** (scored by term coverage and saturating frequency, weighted by term specificity, starting at a clean boundary) and assembles one numbered context. The character budget per page is **rank-weighted** — rank 1 receives the most — which keeps prompts compact.
+
+**Security**
+
+- **SSRF protection:** only public addresses are allowed; private, loopback, link-local, carrier-grade NAT, multicast, unique-local and IPv4-mapped or embedded-IPv4 forms are refused, and unusual numeric encodings (decimal, hex, octal, short forms) are normalized before checking.
+- **Queries are guarded:** a query containing a secret or credential is **not sent** to an external engine.
+- **Fetched text is untrusted data.** It is scanned for prompt-injection phrasing in many languages, offending lines can be neutralized, secrets are masked, and content is wrapped in an explicit untrusted-content envelope whose closing tag cannot be forged in any capitalization or spacing.
+- Limits are configurable through environment variables (deadline, concurrency, pool size, keyless toggle).
+
+Inside CodeMind it is exposed as `web_search` and `deep_web_search`, the `/search` and `/search/health` endpoints, and the `search` test command.
+
+---
+
+# Part V — Running the system
+
+## 20. Data Pipeline and the Offline Graph Cache
+
+### 20.1 Data connection
+
+`DataConnector` attaches to the data folder and **streams** training data without loading it all: line-delimited JSON, JSON, folders of source files, and paired prompt/code data. Large files are read through a windowed shuffle buffer, which caps RAM use. It keeps an SSD **shard cache** with a size cap and least-recently-used pruning, so the cache cannot grow without bound over long runs. When the data fits in RAM (up to a few hundred thousand samples), training order is weighted so under-represented human languages are pulled forward — no sample is dropped, only the order changes; in streaming mode the shuffle window plays that role.
+
+### 20.2 The training plan from real data
+
+As described in Section 4.3, the plan follows the **measured** size of the connected data: every brain phase reads the full dataset once, and total sample-exposures are the dataset count times the number of phases.
+
+### 20.3 Parallel, cached parsing
+
+Parsing is deterministic CPU work. `_ParsePrefetcher` parses upcoming samples ahead of the GPU on **real separate processes** (threads would still be serialized by Python's interpreter lock), sized from the machine's actual CPU count. `_GraphCache` stores parsed graphs and validator results keyed by a **content-derived sample id plus the execution-test flag**, so every pass after the first reuses the work. It stores plain JSON — never pickle — because nothing in a graph is a tensor.
+
+### 20.4 Offline pre-building (`build_graph_cache.py`)
+
+Because parsing needs no GPU, the script does it once, on ordinary CPU hardware, **before any GPU is rented**. It imports the *same* parser, worker function, validator and connector from the core module — no graph-building logic is duplicated, so a pre-built graph is byte-identical to one training would compute itself. Its properties:
+
+- **Resumable and append-only:** finished keys are skipped on restart, including when new training data is added later.
+- **Crash-tolerant:** results are flushed and synced periodically; corrupt or half-written trailing lines are detected and truncated on resume; a last record lacking its terminating newline is repaired so the next record cannot fuse with it.
+- **No duplicates:** repeated sample ids within one input are suppressed rather than written twice.
+- **Key-compatible:** the execution-test flag must match training's setting exactly, or the keys will not match and the bundle will not be used.
+
+---
+
+## 21. Training Runtime and Reliability
+
+**Streaming pipeline.** Data → Parse → Graph → HGT → Loss → Backprop → Validate → PPO → Quality, reported continuously as 0–100% progress.
+
+**One optimizer, one schedule.** Every trainable module — the three brains, encoder, fusion, bridge, router, and the small heads — sits in a single AdamW optimizer with warm-up followed by cosine decay, **computed against the real total step count across all phases**. Biases, normalization parameters and embeddings are excluded from weight decay. Optimizer momentum is restored on resume, and the schedule resumes from where it stopped rather than replaying warm-up.
+
+**Numerics and memory**
+
+- **BF16 autocast** with TF32 enabled; a precision manager can downgrade under memory pressure but is locked during training. (FP8 was removed after analysis showed it never changed what was stored or computed.)
+- **Gradient checkpointing** in the brains and decoder.
+- **`torch.compile`** on the bridge with a **runtime fallback**: compilation is lazy, so a failure on first real use permanently switches to eager mode for the session instead of failing every step.
+- **CUDA allocator tuning** (expandable segments, with split-size and garbage-collection thresholds as a fallback where expandable segments are unavailable), because apparent VRAM growth in long runs was fragmentation, not a Python leak.
+- **Per-layer NaN/Inf guards** (enabled by default) and non-finite-step skipping in PPO.
+- **Bounded RAM:** hot caches (mastery, curiosity) are bounded least-recently-used maps backed by disk; the spill cache uses `safetensors` and JSON only and has a size cap.
+
+**Checkpoints and recovery**
+
+- **One `.safetensors` file for the whole model** (all three brains, bridge, router, encoder, fusion, decoder, policy head, and the appropriateness and masked-word heads) plus a JSON metadata file; a component missing from an older checkpoint starts from random values with a warning instead of making the whole file unusable. Loaders try **`weights_only`** mode first and fall back, with a warning, only for legacy files.
+- **Three rotating slots**, saved at a fixed step interval; writes go to a temporary file and are **atomically renamed with retry and back-off**. The slot counter is re-derived from disk on start so rotation survives restarts.
+- **Graceful shutdown:** `SIGTERM`/`SIGINT` set a flag checked at a safe point, triggering an orderly save instead of losing up to one interval on every restart.
+- **Preflight** (`preflight`, `preflight_report`): before a multi-hour paid run, checks the configuration against any checkpoint it is meant to resume (a changed width would otherwise fail at load and silently restart from step zero) and that there is enough disk to save.
+- **All planned phases complete** in dual-brain mode (Section 9.2).
+
+---
+
+## 22. Serving, CLI, Packaging, Security
+
+### 22.1 Command line
+
+| Command | Purpose |
+|---|---|
+| `train` | Connect data and train |
+| `serve` | Start the HTTP API for IDE/web integration |
+| `project` | Recursively read and understand a whole directory |
+| `status` | Model, data and checkpoint status |
+| `cache` | View or clear the SSD shard cache |
+| `release` | Export a distributable release pack |
+| `demo` | Auto-detect + polyglot + train demonstration |
+| `calc`, `mathgen`, `mathtest` | Math engine (no model load) |
+| `langs` | Inspect human languages present in data |
+| `graphcheck` | Validate code and language graphs on real data; confirm tree-sitter availability |
+| `search` | Test the search system |
+
+Running with no subcommand prints help and concrete examples.
+
+### 22.2 HTTP API
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health`, `GET /status` | Liveness and full system status |
+| `GET /docs` | Machine-readable API description, generated from the same single endpoint table used for documentation, so they cannot disagree |
+| `POST /generate` | Generate code (abstains unless forced) |
+| `POST /understand` | Deep understanding of code |
+| `POST /validate` | Run the validator |
+| `POST /calc` | Deterministic math and physics |
+| `POST /search`, `GET /search/health` | Web search and its health |
+
+The server uses **one thread per request**. Inputs are type-checked (the prompt must be a non-empty string; temperature must be a number in a sane range), request bodies are size-capped, and an **API key** may be required (compared in constant time). Starting a server that accepts outside connections with no API key prints a prominent warning.
+
+### 22.3 Service-side ceilings
+
+`RuntimeConfig`, read from a separate JSON file at start-up, holds **serving** limits — maximum output, lines, input size, generation deadline, request-body size and the API key. **Every limit defaults to unlimited.** This is deliberate: acceptable length is a property of *the operator's service*, not of the model, so nothing about it is baked into the weights. A missing or malformed file means "no limits", never a crash.
+
+### 22.4 Release pack
+
+`export_release` writes a self-contained folder: the weights (optionally down-cast to bf16 for roughly half the size) and their metadata; the **action codec** (required at inference); a **sanitized config** with machine-specific paths removed; **README / MODEL_CARD / API** documents generated from the real model at export time (never hand-written and stale, and including the real parameter count); and a **manifest of SHA-256 hashes** for integrity. **No source files are included** — the pack is a model, not a codebase. `from_pretrained` loads it in one line. `export_brain_pack` produces structured context for external tools such as IDEs.
+
+### 22.5 Security posture
+
+- No pickle in caches or checkpoints; `safetensors` plus JSON; `weights_only` loading.
+- Constant-time API-key comparison; size-capped bodies; validated inputs; a warning for open-network binds.
+- Code execution (validator) is isolated and skipped for dangerous patterns; see Section 25 for the operational requirement.
+- Web content is untrusted data; secrets are never sent out in queries or copied into logs; SSRF is closed.
+- Regular-expression hot paths were audited against adversarial long inputs.
+
+---
+
+# Part VI — Reference
+
+## 23. Engineering Notes: Real Bugs, Real Fixes
+
+These come from the source's own dated change markers and from the final hardening pass — not generic lessons.
+
+**Model and training**
+
+- **Dead contrastive term.** One-pair-per-step training made the largest alignment term exactly zero; a detached bank of recent targets supplied real negatives.
+- **Router ignored its task id.** One shared bias served every brain; it is now a per-brain table, which also made adding experts meaningful.
+- **Load-balance formulation.** An earlier per-call "equalize all probabilities" penalty worked against sparse specialization; it was replaced by the measured-load form plus z-loss, importance loss and selection bias. Auxiliary losses from **every** router call in a step are now averaged (formerly only the last call received gradient).
+- **Bridge anchor amnesia.** Anchors were overwritten each phase; they are now blended with exponential decay.
+- **Collapser dangling edges.** After a chain bypass, edges could still point at deleted nodes; this only appears on large graphs, so it had been silent.
+- **Edge-softmax fast path never ran.** A guard matched only 1-D scores while the real caller always passed 2-D — every call silently used the slow loop. Throughput, not numbers, was affected.
+- **Eight undeclared relations.** Created by the builders for the file's whole life but missing from the schema, so they had no attention weights of their own.
+- **Untrained long-context positions.** Led to a separate train length versus ceiling, position-offset augmentation and the move to rotary positions.
+- **Wasted decode compute.** The cache was rebuilt every step once the ceiling was hit; it is now amortized across many steps.
+- **`max_tokens` accepted but unused** — now wired through. **Inference built autograd graphs** — fixed with inference mode. **Hidden host–device synchronizations** and **unbounded RAM dictionaries** — removed.
+- **Language graphs and quality.** Dual-brain mode previously stopped all remaining phases when one phase met a quality target; every phase now completes.
+
+**Reliability and operations**
+
+- **Graceful shutdown**, **CUDA allocator fragmentation**, **compiled-bridge runtime fallback**, **empty CLI invocation** — each fixed.
+- **Pickle in caches and checkpoints** replaced by safetensors and JSON; legacy loading guarded.
+- **Generation ceiling coupled to serving limits** — separated (Sections 13.2 and 22.3).
+- **Checkpoint rotation reset on restart** — the slot counter is now rebuilt from disk.
+- **Optimizer momentum lost on resume** — now restored.
+
+**Hardening pass**
+
+- **Quadratic-time regular expressions** in prompt-injection scanning, e-mail and connection-string detection and graph-building patterns were bounded; verified with adversarial-input timing.
+- **Scan-window evasion** in linguistic safety closed (head-and-tail scanning, `scan_clipped` flag).
+- **Untrusted-content envelope** made un-forgeable across capitalization and spacing.
+- **Offline cache:** torn-write repair and duplicate suppression.
+- **API:** input validation, open-bind warning, `weights_only` loading, atomic head saves.
+- **Search:** rarity-weighted relevance, mirror-title de-duplication, rank-weighted page budgets, better passage selection.
+
+---
+
+## 24. Key Parameters
+
+*(Architecture scale only. Training hyperparameters, loss weights, learning rates and reward coefficients are intentionally not published.)*
+
+| Parameter | Value |
+|---|---|
+| **Target total parameters** | **≈ 6 B** (architecture arithmetic ≈ 5.9 B; authoritative count from `get_status()`) |
+| **Target hardware** | **1 × NVIDIA B200 SXM, 180 GB** |
+| Training state | ≈ 16 bytes per parameter (≈ 95 GB at 5.9 B) |
+| Hidden width | 1,664 (brains, decoder, router, bridge) |
+| Attention heads | 64 in brains (26 dims each); 16 in decoder |
+| Brain depths | C = 16, A = 8, B = 7 HGT layers |
+| Node / relation types | 15 / 31 |
+| Registered languages | 68 |
+| Routing | 12 experts, top-3; 3 task-bias rows (C = 2, A = 0, B = 1); one router, one bridge |
+| Expert structure | pre-norm two-layer FFN, inner width 2×, temporal average |
+| Expert communication | one self-attention layer over the selected experts (8 heads), gated residual |
+| Decoder | 9 layers, closed vocabulary ≈ 8,000, 8 memory-prefix tokens, rotary positions |
+| Decoder context | 170,000 positions ceiling; 140,000 training length; curriculum from ≈ 4,096 over the first quarter of the run |
+| Graph budget | 12,288 nodes after collapse |
+| Replay buffers | 256 entries each (language, code); anchors from the latest 32 |
+| PPO | policy head with 1,024-way action space; buffer of 32; decoder RL every few steps (configurable) |
+| Checkpoints | 3 rotating slots, fixed-interval saves, atomic writes |
+| Precision | BF16 autocast, TF32 |
+| Training plan | each of the 3 phases reads the full connected dataset once |
+| Data needed for a 6 B model | ≈ 140–210 GB of unique data and above (Section 4.3) |
+
+---
+
+## 25. Realistic Scope & Open Questions
+
+- **A solo, actively evolving system.** The dated change markers in the source show a system that has been run, broken and fixed repeatedly. That is real evidence of engineering care, but a different kind of evidence from an external benchmark.
+- **The 6B configuration has not been validated end-to-end.** The parameter count is an architecture estimate until measured on the real model. Brain C's contribution to code quality, the expert-communication block, and the new router losses each need ablations on real runs.
+- **Model size follows data size.** Below roughly 140 GB of unique data, a 6B model is larger than compute-optimal; reduce depth before reducing data quality.
+- **The two RL levels are not equal.** The policy head learns calibrated confidence from validation of training targets; the decoder's trajectory RL is what shapes generation toward valid code. Its gradient is a baseline-subtracted policy gradient with high single-rollout variance, which is why trends are logged over windows.
+- **Internal validator scores are a strong in-distribution proxy**, because several independent checks combine so one failure cannot be hidden. How that transfers to unfamiliar codebases is a separate question only external benchmarking can settle.
+- **Reward hacking is a bounded, real risk** in any RL-from-a-learned-validator loop. Fixed primary terms, small bounded auxiliary terms, real-measurement-driven adaptation and the hack detector reduce — but do not remove — the incentive to game the validator.
+- **Execution-based validation needs genuine sandboxing** as an operational requirement whenever it is enabled. Running untrusted candidate code always does.
+- **Long-context cost is real.** A 140,000-position training length is feasible through linear-memory attention, but compute still grows quadratically; the curriculum mitigates this, it does not remove it.
+- **Generated code has no built-in syntax guarantee.** Validity comes from the validator, the RL loop and abstention, not from a per-language unparser.
+- **Safety is policy-driven by design.** The module does exactly what the supplied policy says — and nothing if the policy is empty. Choosing the policy is the operator's responsibility.
+- **Search depends on configuration.** Without a keyed backend, general web search is limited to the keyless sources.
+
+The honest summary: the mechanisms described here are real, were checked against the implementation, and interoperate as described. That is a stronger claim than "the architecture sounds plausible", but it is not the same claim as "independently benchmarked", which remains open.
+
+---
+
+## 26. Component Index
+
+| Concept | Main components | File |
+|---|---|---|
+| Language table and detection | `LanguageRegistry`, `LanguageSpec` | CodeMind.py |
+| Parsers | `MultiLanguageParser`, `CPGBuilder` (Python `ast` path), `TreeSitterASTBuilder`, `GenericASTBuilder` | CodeMind.py |
+| Polyglot | `PolyglotProject`, `PolyglotLinker`, `MultiProjectConnector` | CodeMind.py |
+| Human-language graphs | `build_language_graph`, `NLDetector` | CodeMind.py |
+| Encoding | `TokenEfficientEncoder`, `GraphTensorizer`, `SemanticFusion` | CodeMind.py |
+| HGT | `HGTLayer`, `HGTBrain` | CodeMind.py |
+| Three-brain orchestration | `DualBrainOrchestrator`, `DualBrainState` | codemind_brain_dual.py |
+| MoE routing | `FlyPromptRouter`, `TemporalEnsembleExpert`, `ExpertCommsBlock` | codemind_brain_dual.py |
+| Bridge | `AntiForgetBridge` | codemind_brain_dual.py |
+| Graph collapsing | `GraphCollapser`, `CollapseStats` | codemind_brain_dual.py |
+| Generation | `GraphActionCodec`, `CodeDecoder`, `GraphRenderer`, `LargeCodeHandler` | CodeMind.py |
+| Validation | `CodeValidator`, `StaticAnalyzer`, `IntegrityChecker`, `CodePurityChecker`, `QualityEngine` | CodeMind.py |
+| Supervised losses | `CodeMindLoss`, `LanguageMaskHead`, `LossBalancer`, `AppropriatenessHead` | CodeMind.py |
+| RL — policy head | `CodePolicyHead`, `PPOAgent` | CodeMind.py |
+| RL — decoder | `generate_rl`, `_decoder_rl_step`, `RunningBaseline` | CodeMind.py |
+| RL — reward | `CuriosityPPOReward`, `PPORewardBreakdown`, `RewardWeightAdapter`, `CuriosityMemory`, `TrustTracker`, `ExperienceBank` | CodeMind.py |
+| Math | expression evaluator, exact solver, root finder, integrator, Runge–Kutta, text verifier | CodeMind.py |
+| Data | `DataConnector`, `compute_training_plan`, `_ParsePrefetcher`, `_GraphCache` | CodeMind.py |
+| Offline cache | `build_graph_cache.py` | build_graph_cache.py |
+| Training | `TrainingPipeline`, `TrainConfig`, `PrecisionManager`, `SSDCache` | CodeMind.py |
+| Serving and packaging | `RuntimeConfig`, `ApiEndpoint`, `export_release`, `from_pretrained` | CodeMind.py |
+| Safety | `LinguisticSafety`, `SafetyPolicy`, PII and secret scanners | linguistic_safety.py |
+| Search | `SearchSystem`, backends, trust catalog, `deep_search` | search.py |
