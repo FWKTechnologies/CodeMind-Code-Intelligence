@@ -357,7 +357,7 @@ flowchart LR
 - **Phase A.** Brain C runs **without gradient** and, from this point on, is **frozen with its optimizer state released** (Section 4.3). Its embedding is fused with Brain A's routed output through the bridge. Both the source graph and the target graph go through Brain A.
 - **Phase B.** Brain C again runs without gradient. Brain A (with Brain C's embedding fused) encodes the source; its embedding is fused into Brain B's routed output through the same bridge; Brain B encodes the target. The anti-forget penalty (Section 11) is active.
 
-**Everything except Brain C after Phase C stays in one optimizer** with one warm-up-then-cosine learning-rate schedule computed over the whole run. A phase decides *which brain's data path is exercised*; Brain A keeps receiving gradient in Phases B as well, protected by the bridge's anchor and penalty. Each fusion uses the **actual embedding produced for that very sample** (detached from the upstream brain), while a separate slowly-moving **anchor** exists only for the forgetting penalty.
+**All brain-side modules stay in one optimizer** (the three brains, encoder, fusion, bridge, router, small heads and math modules) with one warm-up-then-cosine learning-rate schedule computed over the whole run; after Phase C, Brain C simply stops receiving gradient (Section 4.3). The decoder and the PPO policy head each have their own optimizer. A phase decides *which brain's data path is exercised*; Brain A keeps receiving gradient in Phase B as well, protected by the bridge's anchor and penalty. Each fusion uses the **actual embedding produced for that very sample** (detached from the upstream brain), while a separate slowly-moving **anchor** exists only for the forgetting penalty.
 
 **Why sequential phases.** Training one stack for several jobs at once tends to let one skill erode another over a long run. Sequential emphasis, with an anchor recorded at each phase boundary, lets each brain specialize while staying connected.
 
@@ -380,7 +380,7 @@ The orchestrator keeps two small replay buffers — language embeddings (Phase C
 
 - **Masked-word feature objective (`LanguageMaskHead`).** Without it, Brain C would learn only the properties of a prompt that help predict a code embedding. A fraction of the words in each prompt are hidden behind a mask vector, and Brain C must recover the **input features** of the hidden words from context. It needs no per-language vocabulary, works for every language the encoder handles, and **reuses the same forward pass** as the main loss — no extra pass. Its weight is moderate, so code remains the primary goal.
 - **`LossBalancer`.** The language term is kept at a target *share* of the total loss by adapting its weight to the measured loss sizes (smoothed, bounded, with a warm-up period). Balancing by loss magnitude stands in for balancing by gradient, at no extra backward cost.
-- **`AppropriatenessHead`.** A very small classifier on Brain C's **detached** embedding predicting two independent axes: *severity* (how much care the content needs) and *casualness* (register). No gradient flows from it into any brain; its weights travel in the same model file as everything else, and a checkpoint without it simply starts the head from random values.
+- **`AppropriatenessHead`.** A very small classifier on Brain C's embedding predicting two independent axes: *severity* (how much care the content needs) and *casualness* (register). It is **optional and off by default**: it trains only when a labelled file of texts with severity and casualness scores is supplied, one example per Phase C step in round-robin order, inside the same step and optimizer (no separate loop). When active, its loss **does** flow into Brain C — that is intended, so the language brain also learns to represent register, not only code-prompt similarity. The labels come from the operator's own file, not from the safety module. Its weights travel in the same model file as everything else, and a checkpoint without it starts the head from random values.
 
 The language brain can be disabled, reducing the chain to two phases (A → B) — meant for starting a fresh, smaller model, not for resuming a three-brain checkpoint.
 
@@ -547,10 +547,14 @@ Phase-specific and auxiliary terms are added on top:
 |---|---|
 | Anti-forget penalty (capped) | Phase B |
 | Router balancing loss, averaged over all calls in the step | all phases |
-| Masked-word loss (balanced by `LossBalancer`) and appropriateness loss | Phase C |
+| Masked-word loss (balanced by `LossBalancer`); appropriateness loss when a labelled file is supplied | Phase C |
 | **Math head loss** (Section 17.4) | any batch that contains rows with engine-computed labels |
 
-The **decoder is trained inline** with the main step, from the source embedding already computed, using teacher-forced cross-entropy — no second forward pass and no separate decoder stage. Its cross-entropy gradient flows back into the brains through the fused embedding, which is how generation quality shapes understanding. Gradient accumulation gives an effective batch of roughly a thousand samples per optimizer update.
+The **decoder is trained inline** with the main step, from the source embedding already computed, using teacher-forced cross-entropy — no second forward pass and no separate decoder stage. The decoder has **its own optimizer and schedule**, and its backward pass runs immediately in the same step.
+
+**A controlled gradient bridge.** The decoder does not see the brain's embedding raw. A *soft bridge* passes forward the full value but lets only a **small, fixed fraction of the decoder's gradient** flow back into the brains; the rest is cut. Cutting it entirely would mean generation quality never influences understanding (the two systems would live in separate worlds); letting all of it through would let the decoder's loss — whose scale differs greatly from the understanding losses — pull representations until the objectives collide. A small blended fraction nudges the representation toward being useful for generation while the understanding objectives keep control, adds no parameters and changes no tensor sizes. The same reasoning is why the PPO head's states are *fully* detached: its states are buffered across many steps, and keeping their computation graphs alive would cost enormous memory, whereas the decoder's backward happens in the very step that produced the embedding.
+
+Gradient accumulation gives an effective batch of roughly a thousand samples per optimizer update.
 
 ---
 
@@ -589,7 +593,7 @@ flowchart TB
 | Cadence | Buffered; updates when its replay buffer is full | Every few training steps (six by default; one environment variable) |
 | Reaches the brains? | No — states are detached | No — `understand()` runs without gradient |
 
-**An important and honest consequence:** neither RL level sends gradient into the three brains. The brains are shaped by the supervised objectives (including the decoder's cross-entropy, which does flow back through the fused embedding); RL shapes the **decoder** and the **confidence head**. That is a design choice — the brains' representations stay anchored by supervised signal while RL tunes behaviour where a non-differentiable outcome actually matters.
+**An important and honest consequence:** neither RL level sends gradient into the three brains. The brains are shaped by the supervised objectives (including a small controlled fraction of the decoder's cross-entropy gradient, Section 15); RL shapes the **decoder** and the **confidence head**. That is a design choice — the brains' representations stay anchored by supervised signal while RL tunes behaviour where a non-differentiable outcome actually matters.
 
 ### 16.2 Level 2 — decoder trajectory RL
 
@@ -744,7 +748,7 @@ PII is scanned **once** per message and shared between redaction and reporting; 
 
 ### 18.5 Where it is used
 
-Inside CodeMind this module contributes **small auxiliary reward terms** (severity and register), supplies training data for the appropriateness head, and — when a policy file is configured — screens incoming API requests before they are processed. It never decides whether code is valid; that is the validator's job.
+Inside CodeMind this module contributes **small auxiliary reward terms** (severity and register) and screens incoming API requests before they are processed. The policy is read from an explicit path in the configuration or from a `safety_policy.json` placed in the data folder; with neither, the module starts from an **empty policy**, so its wordlist categories block nothing until the operator defines them. If the module is unavailable or fails, requests pass through unfiltered rather than failing. It never decides whether code is valid; that is the validator's job.
 
 ---
 
@@ -822,13 +826,13 @@ In the order the pipeline performs it (batched mode does the same work over a mi
 5. **Validate and label.** The validator scores the target; its findings become issue labels; a quality report and a source–target similarity are computed.
 6. **Decoder step.** The decoder is trained inline by teacher-forced cross-entropy on the target actions.
 7. **Policy head step.** State, action and reward are stored; the PPO head updates when its buffer is full.
-8. **Loss assembly.** The six supervised terms, plus the phase-specific terms (anti-forget in B, masked-word and appropriateness in C), the step-averaged router balancing loss, and the math-head loss when labels exist.
+8. **Loss assembly.** The six supervised terms, plus the phase-specific terms (anti-forget in B; masked-word in C, and appropriateness in C when a labelled file is supplied), the step-averaged router balancing loss, and the math-head loss when labels exist.
 9. **Backward and update.** Gradients accumulate over the configured number of micro-steps; at the boundary the optimizer applies a clipped update, skipping any non-finite step.
 10. **Every few steps:** one **decoder RL rollout** (Section 16.2); periodically a checkpoint, a validation/quality pass, and a VRAM-governor check.
 
 ### 21.2 Optimizer and schedule
 
-Every trainable module — the three brains (Brain C only while it is trainable), encoder, fusion, bridge, router, the small heads, and the math adapter and head — sits in a **single AdamW optimizer** with warm-up followed by cosine decay, **computed against the real total step count across all phases**. Biases, normalization parameters and embeddings are excluded from weight decay. Optimizer momentum is restored on resume and the schedule resumes from where it stopped rather than replaying warm-up.
+Every brain-side module — the three brains, encoder, fusion, bridge, router, the small heads, and the math adapter and head — sits in a **single AdamW optimizer** (Brain C stays in its parameter list after Phase C but has no gradient, so AdamW skips it) with warm-up followed by cosine decay, **computed against the real total step count across all phases**. Biases, normalization parameters and embeddings are excluded from weight decay. Optimizer momentum is restored on resume and the schedule resumes from where it stopped rather than replaying warm-up.
 
 ### 21.3 Memory and VRAM management
 
