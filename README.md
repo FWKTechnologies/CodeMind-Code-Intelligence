@@ -73,7 +73,7 @@ CodeMind represents source code as a **typed, heterogeneous graph** — function
 
 They are joined by **one learned anti-forget bridge** and steered by **one mixture-of-experts router** (12 experts, 3 active per decision) that holds a separate routing bias for each brain. A causal transformer, the **CodeDecoder** (9 layers, rotary positions, up to 170,000-position context), turns the fused understanding into a sequence of *structural actions* from a closed vocabulary; a renderer turns them back into source text.
 
-**Learning has three layers.**
+**Learning has three layers**, run as **joint training** — all three brains, the bridge, the router and the decoder train together, for **three full rounds over all of the connected data** —
 
 1. **Supervised objectives** align instructions, code understanding and code targets, and teach the decoder by teacher forcing.
 2. **A two-level reinforcement-learning system.** *Level 1* is a clipped-objective PPO head that learns calibrated confidence and value, so the model knows when to abstain. *Level 2* is a true trajectory-level policy gradient on the decoder, driven by a multi-layer automated validator, which teaches the decoder to produce code that actually validates — something cross-entropy cannot teach.
@@ -99,7 +99,7 @@ flowchart TB
       GC --> PF[Parse prefetch workers<br/>real processes]
       D --> PF
       MC[Math curriculum<br/>engine-verified rows] --> PIPE
-      PF --> PIPE[TrainingPipeline<br/>phase C → phase A → phase B]
+      PF --> PIPE[TrainingPipeline<br/>joint training · 3 full rounds]
       PIPE --> CK[(Checkpoints<br/>3 rotating slots · atomic writes)]
       PIPE --> Q[QualityEngine 0–100%]
     end
@@ -182,13 +182,15 @@ Computed analytically from the configuration by the same formulas the code uses 
 
 One HGT layer is ≈168 M parameters, almost all of it the **per-node-type** query/key/value/output matrices (15 node types × four 1,664 × 1,664 matrices); the per-relation attention tensors add only ≈1.3 M per layer. Depth is therefore the main size lever: **each layer costs ≈0.17 B**, and Brain C — the newest and least-proven brain — is the one adjusted first.
 
-### 4.3 Memory: static budget and how it changes across phases
+### 4.3 Memory: static budget and how it behaves across training modes
 
 Weights, gradients and AdamW state cost **≈16 bytes per parameter**. At 6.08 B parameters that is **≈97 GB** of static memory on a 180 GB card, leaving ≈80 GB for everything that scales with input rather than with model size: decoder activations at very long context, HGT activations over graphs of up to 12,288 nodes, the MoE and PPO buffers, and allocator overhead. The decoder's attention uses a fused flash-style kernel, so its memory is **linear** in context length; compute remains quadratic, an accepted cost.
 
-**Brain C is frozen the moment Phase C ends.** From then on it is used only as a feature extractor (its embedding is computed without gradient in Phases A and B), so keeping its gradient buffers and AdamW moments would be pure waste. At the end of Phase C the pipeline therefore stops requiring gradients on Brain C, **drops its gradient tensors and deletes its optimizer state**, and empties the allocator cache. That releases **12 bytes per parameter ≈ 35 GB** at Brain C's ≈2.9 B parameters, taking the static budget from ≈97 GB to **≈62 GB** for Phases A and B and leaving ≈118 GB for activations and long-context training. The optimizer's parameter list is deliberately left untouched, so the positions of saved momentum state still match across checkpoints and resumes; AdamW simply skips parameters without gradients. If a run is started again in the same process, Brain C is made trainable again for its Phase C.
+**Default (joint training): nothing is frozen.** All three brains train in every round, so the full ≈97 GB is resident throughout and ≈80 GB remains for activations. Brain C's word graphs are tiny next to the code graphs, so its activations are a small part of that.
 
-A second protection — the **VRAM governor** — operates inside every phase and is described in Section 21.3.
+**Sequential mode (optional): Brain C is released after Phase C.** With `joint_training` off, Brain C is used only as a feature extractor in Phases A and B, so at the end of Phase C the pipeline stops requiring gradients on it, drops its gradient tensors, deletes its optimizer state and empties the allocator cache — ≈35 GB back (static ≈62 GB). The optimizer's parameter list is deliberately left untouched so saved momentum positions still match across resumes.
+
+A second protection — the **VRAM governor** — operates inside every round and is described in Section 21.3.
 
 ### 4.4 Data-driven sizing — model size follows data size
 
@@ -214,12 +216,11 @@ The advisor runs **every time data is connected** and logs its verdict. It **rep
 
 The data folder's real size is measured with a fast directory scan (an environment-supplied estimate is used only when nothing can be measured), and the sample count follows from it. Then:
 
-- **Every brain phase reads the full connected dataset once.** With three phases (C, A, B) each sample is seen three times in a run; the data is *not* divided between phases.
-- Total sample-exposures equal three times the connected sample count, and the learning-rate schedule is computed against that real total.
-- If no data is connected yet, a placeholder size is used only for reporting; it never overrides a measured size.
-- Data of any size works — tens of thousands of samples or a hundred million or more produce a correct plan; the plan neither clamps down to an old number nor inflates a small dataset.
-
----
+- **Three full rounds** (`train_rounds = 3`). **Each round is one complete pass over all of the connected data** — and in every round **all brains train together on every sample** (Section 9.2). Total sample-exposures are three times the connected sample count, and the learning-rate schedule is computed against that real total. For a 275–285 GB corpus that means the full corpus, three times.
+- **Almost no data is held out.** In streaming mode the validation hold-out is capped at 0.2 % of the samples (≈0.5 GB of a 280 GB corpus), selected by a stable hash of the sample id so it never leaks into training; a small validation set is read from it at start-up so quality tracking works. (Before, 10 % of the corpus — ≈28 GB — was excluded from training, and no validation set was actually available in streaming mode.)
+- **Rounds are complete.** A round ends when the data stream is exhausted, not when a counter is reached, so no sample is repeated or missed within a round. "Mastered-sample skipping" is **off** in joint rounds (`joint_skip_mastered`), so each of the three rounds really is a full round.
+- **Resumable at sample granularity.** On resume, rounds already completed are skipped and the interrupted round is shortened by the number of samples already trained, so the total exposures stay at three times the corpus. (Order within a round is reshuffled, so the remainder is a fresh random subset rather than the exact unseen tail.)
+- If no data is connected yet, a placeholder size is used only for reporting; it never overrides a measured size. Data of any size works — tens of thousands of samples or a hundred million or more produce a correct plan.
 
 # Part II — Understanding: from text and code to representations
 
@@ -327,48 +328,75 @@ All three brains share the same width (1,664) and head count (64, exactly 26 dim
 
 Brain C is deepest because its job is broadest — every human language, not one code schema. Brain B is one layer shallower than A by intent, but close enough that the anti-forget machinery stays balanced.
 
-### 9.2 What each training phase does
+### 9.2 How the three brains are trained
+
+CodeMind has two schedules. **Joint training is the default**; the sequential schedule remains available (`joint_training = False`) for starting a smaller two-brain model or for experiments.
+
+#### 9.2.1 Joint (simultaneous) training — default
+
+In a joint step **all three brains are trained together on the same sample**, with the same functions, the same router (task ids 2 / 0 / 1) and the same bridge that the sequential phases use:
+
+```mermaid
+flowchart LR
+    I[instruction text] --> LG[word graph] --> BC[Brain C · trains]
+    BC --> R2[router · task 2]
+    R2 -. detached .-> BR1[bridge]
+    S[source graph] --> BA[Brain A · trains]
+    BA --> R0[router · task 0] --> BR1
+    BR1 --> F1[A fused with C]
+    F1 -. detached .-> BR2[bridge]
+    T[target graph] --> BB[Brain B · trains]
+    BB --> R1[router · task 1] --> BR2
+    BR2 --> OUT[fused vector → decoder, losses, PPO head]
+    BC --> AL[Brain C alignment loss<br/>InfoNCE vs. recent targets + cosine]
+    T --> AL
+    BC --> MLM[masked-word loss]
+```
+
+- **Why joint.** A sequential schedule trains each brain once and never returns to it, which is the classic recipe for forgetting. In joint training every brain sees the data in every round (three full passes each, instead of one "own" phase), and nothing has to be protected from a later phase because there is no later phase.
+- **Brain C needs its own signal.** In the chain, Brain C reaches Brain A through a *detached* fusion, so the main loss does not train it. Joint steps therefore add a **Brain C alignment term** (InfoNCE against the bank of recent target embeddings plus a cosine term; the target side is detached and the bank is only read, so this trains Brain C alone), together with the masked-word objective. The alignment weight is scaled by round — full in round 1, 0.7 in round 2, 0.5 in round 3 — so language understanding is learned first and then merely maintained while code skills and generation take over.
+- **Masked words in only half the steps.** The masked-word objective hides words, which would also feed a masked prompt into Brain A's conditioning; so only about half the joint steps mask (`joint_mlm_prob`), and the rest condition Brain A on the clean prompt.
+- **Anti-forgetting across rounds.** The bridge's anchor is refreshed at the end of each round from the recent code embeddings (blended with the previous anchor by decay), so rounds 2 and 3 are penalized for drifting away from what the previous round learned (Section 11). In round 1 the anchor does not exist yet, so the penalty is zero.
+- **Decoder RL waits for a decoder worth rolling out.** A decoder that has barely begun learning produces mostly broken rollouts; running RL then spends validator time on negative samples. The decoder-RL cadence is therefore 4× sparser in round 1, 2× sparser in round 2 and the normal cadence in round 3 (Section 16.2).
+- **A round-end checkpoint** is written after every round, in addition to the periodic step checkpoints.
+
+Compute per sample is higher than a single sequential phase (all brains run with gradient), but the number of passes over the data is the same three; each brain simply gets all three of them.
+
+#### 9.2.2 Sequential schedule — optional
 
 ```mermaid
 flowchart LR
     subgraph PC[Phase C]
       LG1[instruction → word graph] --> BC1[Brain C · trains]
       TG1[target code graph] --> BA1[Brain A as reference encoder · trains]
-      BC1 --> R1[router · task 2]
-      BA1 --> R0[router · task 0]
     end
     subgraph PA[Phase A]
-      LG2[instruction → word graph] --> BC2[Brain C · frozen · no gradient]
-      BC2 --> BRG[bridge]
-      SG2[source graph] --> BA2[Brain A · trains]
-      BA2 --> RA[router · task 0] --> BRG
-      TG2[target graph] --> BA3[Brain A + fused C]
+      BC2[Brain C · frozen] --> BRG[bridge]
+      SG2[source graph] --> BA2[Brain A · trains] --> BRG
     end
     subgraph PB[Phase B]
-      LG3[instruction → word graph] --> BC3[Brain C · frozen · no gradient]
+      BC3[Brain C · frozen] --> BRG2[bridge]
       SG3[source graph] --> BA4[Brain A + fused C · trains]
-      BA4 --> BRG2[bridge] --> BB4[Brain B · trains]
-      TG3[target graph] --> BB4
-      BB4 --> RB[router · task 1]
+      BA4 --> BRG2 --> BB4[Brain B · trains]
     end
 ```
 
-- **Phase C.** The instruction becomes a word graph read by Brain C; its embedding passes through the router with task id 2. The code target is encoded by Brain A as the reference embedding. Two language-only objectives (Section 9.4) are active.
-- **Phase A.** Brain C runs **without gradient** and, from this point on, is **frozen with its optimizer state released** (Section 4.3). Its embedding is fused with Brain A's routed output through the bridge. Both the source graph and the target graph go through Brain A.
-- **Phase B.** Brain C again runs without gradient. Brain A (with Brain C's embedding fused) encodes the source; its embedding is fused into Brain B's routed output through the same bridge; Brain B encodes the target. The anti-forget penalty (Section 11) is active.
+- **Phase C.** The instruction becomes a word graph read by Brain C (router task 2); the code target is encoded by Brain A as the reference embedding. The two language-only objectives are active.
+- **Phase A.** Brain C runs **without gradient** and is **frozen with its optimizer state released** (Section 4.3). Its embedding is fused with Brain A's routed output through the bridge.
+- **Phase B.** Brain C again runs without gradient. Brain A (with C fused) encodes the source; its embedding is fused into Brain B's routed output through the same bridge. The anti-forget penalty is active.
 
-**All brain-side modules stay in one optimizer** (the three brains, encoder, fusion, bridge, router, small heads and math modules) with one warm-up-then-cosine learning-rate schedule computed over the whole run; after Phase C, Brain C simply stops receiving gradient (Section 4.3). The decoder and the PPO policy head each have their own optimizer. A phase decides *which brain's data path is exercised*; Brain A keeps receiving gradient in Phase B as well, protected by the bridge's anchor and penalty. Each fusion uses the **actual embedding produced for that very sample** (detached from the upstream brain), while a separate slowly-moving **anchor** exists only for the forgetting penalty.
+In this mode the three phases are three separate passes over the data and a quality-target or patience stop reached at the end of one phase is logged but does **not** cancel the remaining phases (their validation scores are not comparable).
 
-**Why sequential phases.** Training one stack for several jobs at once tends to let one skill erode another over a long run. Sequential emphasis, with an anchor recorded at each phase boundary, lets each brain specialize while staying connected.
+#### 9.2.3 Common to both schedules
 
-**Every planned phase always runs.** Validation quality of one phase is not comparable with the next, because each phase exercises a different brain. A quality-target or patience stop reached at the end of a phase is therefore logged, the patience counter is reset, and the next phase still runs. (The single-epoch mode keeps the classic early stop.)
+All brain-side modules stay in **one optimizer** (the three brains, encoder, fusion, bridge, router, small heads and math modules) with one warm-up-then-cosine learning-rate schedule computed over the whole run. The decoder and the PPO policy head each have their own optimizer. Each fusion uses the **actual embedding produced for that very sample**, detached from the upstream brain, while a separate slowly-moving **anchor** exists only for the forgetting penalty.
 
 ### 9.3 Train mode versus inference mode
 
 Each brain forward — and the shared router — sets its mode from **whether gradients are enabled**:
 
 - *Gradient enabled* (real training): training mode — dropout on, router noise on, expert and router statistics updating, gradient checkpointing used.
-- *Gradient disabled* (inference, or a frozen Brain C feeding Phases A and B): evaluation mode — fully deterministic, no dropout, no router noise, and **no mutation of any persistent state**.
+- *Gradient disabled* (inference, or a frozen Brain C feeding Phases A and B in the sequential schedule): evaluation mode — fully deterministic, no dropout, no router noise, and **no mutation of any persistent state**.
 
 This matters because the experts' temporal averages are saved in checkpoints. Before this rule, every inference call silently forced training mode, which made inference non-deterministic and let inference data contaminate the very statistics training later resumes from. The router is one object shared by all brains, so it follows the same mode.
 
@@ -485,7 +513,18 @@ One `AntiForgetBridge` joins **both** hand-offs — C → A and A → B — and 
 
 ### 13.1 The action codec
 
-`GraphActionCodec` is the single codec for the whole system. It walks a target graph's *generatable* nodes in a defined order and emits a sequence of **structural actions** from a **closed vocabulary** of about 8,000 entries (line-level labels for functions, statements and calls plus structural markers). The vocabulary is fitted once from your own corpus (`fit_generator_tokenizer`) and saved as `gen_codec.json`, a required companion to the weights. `GraphRenderer` turns an action sequence back into formatted source text per language family.
+`GraphActionCodec` is the single codec for the whole system. It walks a target graph's *generatable* nodes in a defined order and emits a sequence of **structural actions**. Each generated node costs one *type* action followed by its *label*, and a label is written in one of two ways:
+
+1. **Whole-line vocabulary (cheapest).** The ≈8,000 most frequent labels in the corpus (typically a whole line of code) are single ids. A line that hits the vocabulary costs **2 actions** (type + label).
+2. **Sub-line pieces (everything else).** A line outside the vocabulary is spelled out as **pieces** from a learned subword vocabulary (6,000 byte-pair merges plus every single character), between a start marker and an end marker. Pieces average about three characters, like a language model's tokens. Before this vocabulary existed, such lines were spelled one character at a time — about three times the cost of an LLM's tokens for the same text.
+
+Other properties:
+
+- **Whole lines, not 80-character stubs.** The understanding graph keeps only the first 80 characters of a line as a node label, so a longer line used to be generated *truncated*, silently. The codec now takes the full stripped line (up to 240 characters) whenever the label is exactly such a cut; only the codec's own representation changes — the understanding graph and the offline graph cache are untouched.
+- **Fitted once, saved with the weights.** `fit_generator_tokenizer` learns the whole-line vocabulary and the piece merges from the corpus (a one-time cost of tens of seconds) and saves `gen_codec.json`, a required companion to the weights. The decoder's output size is reserved up front (labels + pieces), so it never depends on how many merges were learned. A codec file from before the piece vocabulary loads and simply uses character spelling; a file with more merges than the model reserves is refused rather than silently mismatched.
+- **Measured effect.** On held-out real source files (Python and C, 150 files; whole-line vocabulary and pieces fitted on 850 other files) the total number of actions fell **2.85×** (1.22 M → 0.43 M), and decoding every sequence back reproduced all 44,944 labels exactly. This is a proxy corpus, not your data; the hit rate of the whole-line vocabulary on your 275–285 GB will differ, and it is worth measuring.
+
+`GraphRenderer` turns an action sequence back into formatted source text per language family.
 
 The trade-off is stated plainly: because no language is special-cased on this path, there is no guarantee-by-construction of syntax validity such as a language's own unparser would give. One decoder learning from all 68 languages, disciplined by the validator and the RL loop, is the intended alternative.
 
@@ -506,6 +545,9 @@ The production decoder is **deterministic greedy** with an anti-cycle guard that
 - **`generate_best_of`** — draws diverse candidates and **re-ranks them with the validator**, for callers who want to spend more compute on one final answer.
 - **Abstention** — if validation says the output is unsafe to ship (a cheating pattern, hollow code that does not run, demonstrably wrong behaviour, too many errors), `generate()` **abstains** unless the caller passes `force`.
 - **Math guard** — before validation, wrong arithmetic claims in the output are corrected by the deterministic engine (Section 17.6).
+- **Escalation (new).** The deterministic answer is the fast path and stays the answer whenever the validator accepts it. Only if the validator rejects it (invalid or unsafe, but not "cheating", which abstention handles) does `generate()` spend extra compute: up to three stochastic candidates are sampled and re-ranked by the same validator, the first answer being candidate 0 so the result can tie or improve but never get worse. Answers that pass pay nothing; a thread-local guard prevents recursion; any failure in escalation returns the first answer. It is controlled by `generate_escalate` (0 disables).
+- **GPU-side top-k (new).** At each decision the decoder used to copy the full logit vector (≈14,000 floats) to Python and sort every allowed id (up to 8,000 for a label decision) — measured at ≈1.7 ms of pure-Python work per label decision, on top of the copy. The masked top-k is now computed on the GPU and only 32 (id, logit) pairs are transferred; the decision rule is unchanged unless all 32 best candidates would extend a cycle (then it falls back to the full path). Equivalence with the old path was verified action-for-action on 22 real files with a scripted decoder; the *timing* gain needs a real GPU to measure and is not claimed here.
+- **Cycle guard fixed.** The anti-cycle guard fired on the *third* repetition of a pattern, which blocks ordinary code — three closing braces in a row, repeated `#define` or `case` lines — and in one real C header it blocked 29 legitimate positions. It now triggers at the eighth repetition (still stopping runaway loops quickly) and does not apply inside a spelled label, where a run like `======` is legitimate.
 
 ### 13.4 Large code
 
@@ -590,7 +632,7 @@ flowchart TB
 | What it trains | The small `CodePolicyHead` (actor, critic, confidence) | The **decoder's own weights** |
 | Reward source | Validator result on the **training target**, through the reward engine | Validator result on the **model's own generation**, through the same engine |
 | Main purpose | **Calibrated confidence** — knowing when to abstain | **Behaviour shaping** — producing code that validates, which cross-entropy cannot teach |
-| Cadence | Buffered; updates when its replay buffer is full | Every few training steps (six by default; one environment variable) |
+| Cadence | Buffered; updates when its replay buffer is full | Every few training steps (six by default; one environment variable); in joint training 4× sparser in round 1 and 2× sparser in round 2 |
 | Reaches the brains? | No — states are detached | No — `understand()` runs without gradient |
 
 **An important and honest consequence:** neither RL level sends gradient into the three brains. The brains are shaped by the supervised objectives (including a small controlled fraction of the decoder's cross-entropy gradient, Section 15); RL shapes the **decoder** and the **confidence head**. That is a design choice — the brains' representations stay anchored by supervised signal while RL tunes behaviour where a non-differentiable outcome actually matters.
@@ -796,7 +838,7 @@ Inside CodeMind it is exposed as `web_search` and `deep_web_search`, the `/searc
 
 ### 20.2 The training plan from real data
 
-As described in Section 4.5, the plan follows the **measured** size of the connected data: every brain phase reads the full dataset once, and total sample-exposures are the dataset count times the number of phases. Connecting data also triggers the model-size advisor of Section 4.4.
+As described in Section 4.5, the plan follows the **measured** size of the connected data: each of the three joint rounds reads the full dataset once, so total sample-exposures are three times the dataset count. Connecting data also triggers the model-size advisor of Section 4.4. In streaming mode only a 0.2 % hash-selected hold-out is excluded from training, and a small validation set is read from it so that validation quality is a real number rather than zero.
 
 ### 20.3 Parallel, cached parsing
 
@@ -821,12 +863,12 @@ In the order the pipeline performs it (batched mode does the same work over a mi
 
 1. **Stream.** The next real sample arrives; with the configured probability a math-curriculum row is inserted ahead of it (Section 17.5).
 2. **Parse and collapse.** The source and target are parsed (or fetched from the graph cache) and collapsed to the node budget.
-3. **Encode and forward.** According to the phase: Phase C builds the word graph and runs Brain C (with the masked-word objective) plus Brain A on the target; Phase A runs Brain C frozen, then Brain A on source and target with C fused; Phase B runs Brain C frozen, Brain A on the source, Brain B on the target with A fused. Each pass goes through the router with its task id.
+3. **Encode and forward.** In joint training (default) one step runs Brain C on the word graph, Brain A on the source with C fused, and Brain B on the target with A fused, all with gradient. In the optional sequential schedule, according to the phase: Phase C builds the word graph and runs Brain C (with the masked-word objective) plus Brain A on the target; Phase A runs Brain C frozen, then Brain A on source and target with C fused; Phase B runs Brain C frozen, Brain A on the source, Brain B on the target with A fused. Each pass goes through the router with its task id.
 4. **Math adapter.** The instruction's semantic embedding receives the quantity-feature correction (zero for text without numbers).
 5. **Validate and label.** The validator scores the target; its findings become issue labels; a quality report and a source–target similarity are computed.
 6. **Decoder step.** The decoder is trained inline by teacher-forced cross-entropy on the target actions.
 7. **Policy head step.** State, action and reward are stored; the PPO head updates when its buffer is full.
-8. **Loss assembly.** The six supervised terms, plus the phase-specific terms (anti-forget in B; masked-word in C, and appropriateness in C when a labelled file is supplied), the step-averaged router balancing loss, and the math-head loss when labels exist.
+8. **Loss assembly.** The six supervised terms, plus the joint-training terms (Brain C alignment, masked-word on about half the steps, anti-forget from round 2) — or, in sequential mode, the phase-specific terms (anti-forget in B; masked-word in C, and appropriateness in C when a labelled file is supplied), the step-averaged router balancing loss, and the math-head loss when labels exist.
 9. **Backward and update.** Gradients accumulate over the configured number of micro-steps; at the boundary the optimizer applies a clipped update, skipping any non-finite step.
 10. **Every few steps:** one **decoder RL rollout** (Section 16.2); periodically a checkpoint, a validation/quality pass, and a VRAM-governor check.
 
@@ -838,7 +880,7 @@ Every brain-side module — the three brains, encoder, fusion, bridge, router, t
 
 - **BF16 autocast** with TF32 enabled; a precision manager can downgrade under memory pressure but is locked during training. (FP8 was removed after analysis showed it never changed what was stored or computed.)
 - **Gradient checkpointing** in the brains and decoder.
-- **Brain C release** after Phase C (Section 4.3) — ≈35 GB back for activations.
+- **Brain C release** (sequential mode only, after Phase C; Section 4.3) — ≈35 GB back for activations. In joint training nothing is frozen, so the full ≈97 GB static budget stays resident.
 - **VRAM governor.** A proactive controller reads the real peak memory of the previous mini-batch against the allowed cap and **shrinks the micro-batch before an out-of-memory error happens**, growing it back slowly after a sustained calm period. Graph sizes vary widely, so peaks jump from batch to batch; reducing in advance is cheaper than losing a half-computed step to an OOM. It is a no-op on CPU, and it complements — rather than replaces — the OOM-recovery path that halves the batch on failure.
 - **`torch.compile`** on the bridge with a **runtime fallback**: compilation is lazy, so a failure on first real use permanently switches to eager mode for the session instead of failing every step.
 - **CUDA allocator tuning** (expandable segments, with split-size and garbage-collection thresholds as a fallback where expandable segments are unavailable), because apparent VRAM growth in long runs was fragmentation, not a Python leak.
@@ -852,7 +894,7 @@ Every brain-side module — the three brains, encoder, fusion, bridge, router, t
 - **Three rotating slots**, saved at a fixed step interval; writes go to a temporary file and are **atomically renamed with retry and back-off**. The slot counter is re-derived from disk on start so rotation survives restarts.
 - **Graceful shutdown:** `SIGTERM`/`SIGINT` set a flag checked at a safe point, triggering an orderly save instead of losing up to one interval on every restart.
 - **Preflight** checks the configuration against any checkpoint it is meant to resume (a changed width would otherwise fail at load and silently restart from step zero) and that there is enough disk to save.
-- **All planned phases complete** in dual-brain mode (Section 9.2).
+- **Round-end checkpoint** after each joint round, and resume at sample granularity (completed rounds skipped, the interrupted round shortened; Section 4.5). In sequential mode all planned phases complete (Section 9.2.2).
 
 ---
 
@@ -893,7 +935,7 @@ The server uses **one thread per request**. Inputs are type-checked (the prompt 
 
 ### 22.3 Service-side ceilings
 
-`RuntimeConfig`, read from a separate JSON file at start-up, holds **serving** limits — maximum output, lines, input size, generation deadline, request-body size and the API key. **Every limit defaults to unlimited.** This is deliberate: acceptable length is a property of *the operator's service*, not of the model, so nothing about it is baked into the weights. A missing or malformed file means "no limits", never a crash.
+`RuntimeConfig`, read from a separate JSON file at start-up, holds **serving** limits — maximum output, lines, input size, generation deadline, request-body size, the API key, and (new) **backpressure**: `max_pending_requests` (requests running or waiting for the model; extra ones get HTTP 503 with a retry hint) and `queue_wait_sec` (longest a request may wait for its turn). The model is called one request at a time — one GPU, one decoder state — so without a bound a burst of clients piles up as sleeping threads, each holding a connection and a request body. **Every limit defaults to unlimited.** This is deliberate: acceptable length is a property of *the operator's service*, not of the model, so nothing about it is baked into the weights. A missing or malformed file means "no limits", never a crash.
 
 ### 22.4 Release pack
 
@@ -928,7 +970,7 @@ These come from the source's own dated change markers and from the hardening pas
 - **Untrained long-context positions.** Led to a separate train length versus ceiling, position-offset augmentation and the move to rotary positions.
 - **Wasted decode compute.** The cache was rebuilt every step once the ceiling was hit; it is now amortized across many steps.
 - **Parameter count under-reported (v90).** The start-up log omitted Brain C, the policy head and the small heads and double-counted shared weights; it now counts every module once and prints the analytic estimate beside it.
-- **Optimizer state wasted on a frozen brain (v90).** Brain C's gradients and AdamW moments stayed allocated through Phases A and B; they are now released (≈35 GB).
+- **Optimizer state wasted on a frozen brain (v90).** In the sequential schedule Brain C's gradients and AdamW moments stayed allocated through Phases A and B; they are now released (≈35 GB). Joint training, the default, keeps Brain C trainable and does not use this release.
 - **Dual-brain mode stopped all remaining phases** when one phase met a quality target; every phase now completes.
 - **`max_tokens` accepted but unused** — now wired through. **Inference built autograd graphs** — fixed with inference mode. **Hidden host–device synchronizations** and **unbounded RAM dictionaries** — removed.
 
@@ -940,6 +982,18 @@ These come from the source's own dated change markers and from the hardening pas
 - **Checkpoint rotation reset on restart** — the slot counter is now rebuilt from disk.
 - **Optimizer momentum lost on resume** — now restored.
 - **Out-of-memory handled only after the fact** — a proactive VRAM governor now shrinks the micro-batch first.
+
+**Training schedule, data use and generation efficiency**
+
+- **Ten percent of the corpus thrown away, and no validation anyway.** In streaming mode a 10 % hash hold-out removed ≈28 GB of a 280 GB corpus from training, while the validation routine received an empty list and reported 0.0 for the whole run. The hold-out is now capped at 0.2 % and a real validation set is read from it.
+- **Sequential phases forget.** Replaced as the default by joint training over three full rounds; the sequential schedule remains as an option.
+- **Brain C untrained in a joint chain.** Its only route to the loss is a detached fusion, so joint steps add an explicit alignment term (otherwise it would learn from the masked-word loss and the anchor penalty alone).
+- **Spelled-out labels cost three times an LLM's tokens.** Lines outside the 8,000-entry whole-line vocabulary were spelled one character at a time; a 6,000-merge piece vocabulary now cuts the action count 2.85× on held-out source files.
+- **Silent 80-character truncation** of generated lines, fixed by taking the full line when the label is exactly such a cut.
+- **Anti-cycle guard blocked legitimate code** (repeated braces and directives), and hit spelled labels such as `======`; threshold raised and spelling exempted.
+- **Per-step CPU sort and full-logit copy** on the decode path replaced by GPU-side masked top-k (equivalence verified; timing needs a GPU).
+- **Host RAM read as 16 GB on Linux** (a hard-coded placeholder); it now reads `/proc/meminfo` and the container's cgroup limit.
+- **Unbounded request pile-up** on the server; optional backpressure added.
 
 **Hardening pass**
 
@@ -960,7 +1014,7 @@ These come from the source's own dated change markers and from the hardening pas
 |---|---|
 | **Target total parameters** | **≈ 6.1 B** (analytic estimate 6.08 B; budget 6.0–6.2 B; authoritative count logged at start-up and in the model card) |
 | **Target hardware** | **One NVIDIA B200, 180 GB HBM3e (non-SXM), single GPU** |
-| Static training memory | ≈ 16 bytes per parameter (≈ 97 GB at 6.08 B); ≈ 62 GB after Brain C is frozen |
+| Static training memory | ≈ 16 bytes per parameter (≈ 97 GB at 6.08 B); stays ≈ 97 GB in joint training (≈ 62 GB after Brain C is frozen in the optional sequential schedule) |
 | Hidden width | 1,664 (brains, decoder, router, bridge) |
 | Attention heads | 64 in brains (26 dims each); 16 in decoder |
 | Brain depths | C = 17, A = 8, B = 7 HGT layers (≈ 168 M parameters per layer) |
@@ -968,7 +1022,7 @@ These come from the source's own dated change markers and from the hardening pas
 | Registered code languages | 68 |
 | Routing | 12 experts, top-3; 3 task-bias rows (C = 2, A = 0, B = 1); one router, one bridge; experts ≈ 11 M parameters each |
 | Expert communication | one self-attention layer (8 heads) over the 3 selected experts, gated residual |
-| Decoder | 9 layers, closed vocabulary ≈ 8,000, 8 memory-prefix tokens, rotary positions |
+| Decoder | 9 layers, output vocabulary ≈ 14,100 (≈ 8,000 whole-line labels + 6,000 sub-line pieces + characters and markers), 8 memory-prefix tokens, rotary positions |
 | Decoder context | 170,000 positions ceiling; 140,000 training length; curriculum from ≈ 4,096 over the first quarter of the run |
 | Graph budget | 12,288 nodes after collapse |
 | Replay buffers | 256 entries each (language, code); anchors from the latest 32 |
@@ -978,7 +1032,7 @@ These come from the source's own dated change markers and from the hardening pas
 | Safety | wordlist infrastructure for 44 languages; deflection in 16; 23 PII/secret detector kinds |
 | Checkpoints | 3 rotating slots, fixed-interval saves, atomic writes |
 | Precision | BF16 autocast, TF32 |
-| Training plan | each of the 3 phases reads the full connected dataset once |
+| Training plan | **joint training, 3 full rounds**; each round = one pass over all connected data (hold-out ≤ 0.2 %); ≈ 3 × 111 M sample-exposures at 280 GB |
 | Current data | ≈ 275–285 GB; ≈ 26 effective tokens per parameter at 6.08 B (sizing assumptions: 3.5 bytes/token, 2 effective passes, 20 tokens/parameter target) |
 
 ---
@@ -986,6 +1040,8 @@ These come from the source's own dated change markers and from the hardening pas
 ## 25. Realistic Scope & Open Questions
 
 - **A solo, actively evolving system.** The dated change markers in the source show a system that has been run, broken and fixed repeatedly. That is real evidence of engineering care, but a different kind of evidence from an external benchmark.
+- **The joint-training path has not been run on a GPU.** It reuses the same forward functions, router, bridge and loss as the sequential phases and passes static checks, but this environment has no torch, so the new branches (single-sample and batched), the Brain C alignment term, round bookkeeping, resume logic and the validation materializer were reviewed against the existing code rather than executed. A short real run — one tiny round, then a resume — should be the first thing done before renting the full run. Joint steps also cost more compute per sample than one sequential phase (all brains run with gradient); whether three joint rounds fit the time budget is a measurement to take, not something derived here.
+- **The piece-vocabulary gain is measured on proxy code, not your corpus.** The 2.85× action-count reduction used source files available in this environment; the whole-line hit rate and the benefit on a 275–285 GB corpus must be measured on the corpus itself. The changed codec also changes the decoder's output size, so checkpoints from the previous codec cannot be loaded into it.
 - **The 6.1 B configuration has not been validated end to end.** The parameter count is an analytic estimate until measured on the real model (the start-up log compares the two). Brain C's contribution to code quality, the expert-communication block, the new router losses and the math core each need ablations on real runs.
 - **Model size follows data size — and the rule is an anchor.** At 275–285 GB the 20-tokens-per-parameter rule supports about 8 B; the 6.1 B model sits below that by design (owner budget and VRAM headroom). The rule was designed for token sequences; CodeMind trains on graphs, so treat the ratio as a planning cross-check, not a guarantee.
 - **RL does not reach the brains.** Level 1 trains the confidence head on detached states; Level 2 trains the decoder only. If it turns out that policy-gradient signal should also refine understanding, that would be a deliberate architectural change, not something the current system does.
