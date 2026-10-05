@@ -832,17 +832,30 @@ Inside CodeMind it is exposed as `web_search` and `deep_web_search`, the `/searc
 
 ## 20. Data Pipeline and the Offline Graph Cache
 
-### 20.1 Data connection
+### 20.1 Data connection and the streaming buffer
 
-`DataConnector` attaches to the data folder and **streams** training data without loading it all: line-delimited JSON, JSON, folders of source files, and paired prompt/code data. Large files are read through a windowed shuffle buffer that caps RAM use. It keeps an SSD **shard cache** with a size cap and least-recently-used pruning, so the cache cannot grow without bound over long runs. When the data fits in RAM (up to a few hundred thousand samples), training order is weighted so under-represented human languages are pulled forward — no sample is dropped, only the order changes; in streaming mode the shuffle window plays that role. A held-out validation slice is excluded from training.
+`DataConnector` attaches to the data folder and **streams** training data without loading it all: line-delimited JSON, JSON, folders of source files, and paired prompt/code data. When the data fits in RAM (up to a few hundred thousand samples), training order is weighted so under-represented human languages are pulled forward — no sample is dropped, only the order changes. A small hash-selected validation slice is excluded from training (Section 4.5).
+
+For a corpus far larger than RAM the streaming path does three things:
+
+- **Interleaves files.** Up to 32 files — or, when there are fewer files than that and one is huge (≥ 1 GB), **byte ranges of that file** — are read at the same time and the next sample is drawn from a random open one. The previous design filled its buffer from a single file and drained it before opening the next, so samples were mixed only *within* a file: if files are grouped by language or source, a long stretch of training saw one language only (measured on a synthetic eight-language layout: zero language switches in the first 2,000 samples, against 0.85 after the change, where 1.0 would be perfectly alternating). Ranges start at the first whole line at or after their offset, so together they cover the file exactly once (verified: 6,000 records read, 6,000 unique).
+- **Sizes the shuffle buffer from RAM.** The buffer holds 10 % of the RAM budget at an assumed ~40 KB per held sample, between 20,000 and 600,000 samples — about 425,000 at a 170 GB budget (the old fixed 20,000 was a few hundredths of a percent of a 280 GB corpus). An explicit `shuffle_buffer_size` still wins.
+- **Uses a heap, with random tie-breaks.** Each sample's mastery-based priority is computed **once** and the buffer is a binary heap (O(log n) per sample). The old buffer was kept sorted by scanning it from the front for every new sample and calling the priority function on every element passed. At the start of training every priority is equal, so each sample scanned the whole buffer — at the old 20,000-sample buffer, 20,000 SHA-256-based calls per sample. Measured here with short (≈300-byte) texts at a 5,000 buffer: ≈5 ms per sample against ≈10 µs for the heap, growing linearly with the buffer; with real multi-kilobyte sources each hash costs several times more, so the real figure is higher (an estimate, not a measurement: tens of milliseconds up to ~0.2 s per sample). The feeder shares a thread with the GPU loop, so this caps the whole training rate. Equal priorities also came out in insertion order, so with nothing mastered yet the stream was not shuffled at all; ties are now broken randomly, which makes the buffer a proper windowed shuffle.
 
 ### 20.2 The training plan from real data
 
 As described in Section 4.5, the plan follows the **measured** size of the connected data: each of the three joint rounds reads the full dataset once, so total sample-exposures are three times the dataset count. Connecting data also triggers the model-size advisor of Section 4.4. In streaming mode only a 0.2 % hash-selected hold-out is excluded from training, and a small validation set is read from it so that validation quality is a real number rather than zero.
 
-### 20.3 Parallel, cached parsing
+### 20.3 Parallel parsing and the SSD budget
 
-Parsing is deterministic CPU work. `_ParsePrefetcher` parses upcoming samples ahead of the GPU on **real separate processes** (threads would still be serialized by Python's interpreter lock), sized from the machine's actual CPU count. `_GraphCache` stores parsed graphs and validator results keyed by a **content-derived sample id plus the execution-test flag**, so every pass after the first reuses the work. It stores plain JSON — never pickle — because nothing in a graph is a tensor.
+Parsing is deterministic CPU work. `_ParsePrefetcher` parses upcoming samples ahead of the GPU on **real separate processes** (threads would still be serialized by Python's interpreter lock). The number of processes is derived from the pod's *real* CPUs (cpuset affinity and CFS quota, not the host's logical CPU count) and the container's own memory headroom, leaves two CPUs for the trainer, and is capped at 24 — 24 workers at 28 vCPU. Each worker pins torch to one thread; the training process uses a handful. The validator also runs in the workers, so the GPU loop does not wait on it.
+
+**One SSD budget — 60 GB by default (`CODEMIND_SSD_CACHE_GB`).** The three caches share it: **40 GB** stream-shard cache, **14 GB** graph cache, **6 GB** spill cache for embeddings and small memories. (The previous defaults were 40 + 60 + 20 GB of limits on a disk provisioned for about 60.) Each cache can still be overridden individually.
+
+- **Shard cache — pinned, not LRU.** A pass visits every file once, so an LRU cache smaller than the corpus evicts a file just before it is needed again: hit rate ≈ 0 while still paying to write and delete shards. Once the budget is full no new shard set is started; the files cached first stay cached and are re-read from local disk in every later round (60 GB covers roughly a fifth of a 280 GB corpus), and the rest streams from the source. It only helps when the source disk is slower than the local one.
+- **Graph cache — adaptive.** `put` serializes two graphs to JSON and writes a file *from the thread that feeds the GPU*, and each round visits every sample once in a different order, so a cache that can hold only a tiny fraction of the samples almost never hits. After the first 200 writes the cache measures its record size; if the budget could cover less than 20 % of the samples to be trained on, it stops writing (reads still work). Importing a pre-built bundle (Section 20.4) always writes. At 280 GB the graph cache will normally switch itself off; it pays off only for smaller corpora or repeated runs on the same data.
+- **Size is tracked, not re-scanned.** The caches used to walk their whole directory (several `stat` calls per file) every 200–500 writes, from the training thread, and counted *file size* rather than disk blocks — a cache of millions of 40-byte files was ≈100× bigger on disk than its accounting said. They now scan once, add sizes as they write (in disk blocks), and evict (to 90 %) only when over budget or over a file-count cap; at the default cap that is one scan per ~150,000 writes instead of one per 200.
+- **No file per sample for the three memories on a large run.** Mastery, curiosity and trust used to write a small file per sample. From 1,000,000 samples (`CODEMIND_RAM_ONLY_MEMORY_FROM`) they live in RAM only (≈30–40 GB at 111 M samples, which the machine has) and trust is written once per checkpoint. The cost: mastery and curiosity are not remembered across a restart, which only affects sample *ordering*.
 
 ### 20.4 Offline pre-building (`build_graph_cache.py`)
 
@@ -885,7 +898,7 @@ Every brain-side module — the three brains, encoder, fusion, bridge, router, t
 - **`torch.compile`** on the bridge with a **runtime fallback**: compilation is lazy, so a failure on first real use permanently switches to eager mode for the session instead of failing every step.
 - **CUDA allocator tuning** (expandable segments, with split-size and garbage-collection thresholds as a fallback where expandable segments are unavailable), because apparent VRAM growth in long runs was fragmentation, not a Python leak.
 - **Per-layer NaN/Inf guards** (enabled by default) and non-finite-step skipping in PPO.
-- **Bounded RAM:** hot caches (mastery, curiosity, math scans) are bounded least-recently-used maps backed by disk where relevant; the spill cache uses `safetensors` and JSON only and has a size cap.
+- **RAM budget = 75 % of the pod's memory** (the container's cgroup limit when lower than the host's), spent on the shuffle buffer (10 % of it), the RAM-only memories of a large run, and the parse workers; the OS page cache for the data files and CUDA host memory come on top. Hot caches stay bounded; the spill cache uses `safetensors` and JSON only and has a size cap.
 - **Preflight memory report:** before training, the system prints the static weights-plus-optimizer figure, the saving from freezing Brain C, an estimate of decoder activation at the training context length, and the remaining headroom — flagging real out-of-memory risk and naming the first thing to reduce (the decoder's training length, not its ceiling).
 
 ### 21.4 Checkpoints and recovery
@@ -992,8 +1005,13 @@ These come from the source's own dated change markers and from the hardening pas
 - **Silent 80-character truncation** of generated lines, fixed by taking the full line when the label is exactly such a cut.
 - **Anti-cycle guard blocked legitimate code** (repeated braces and directives), and hit spelled labels such as `======`; threshold raised and spelling exempted.
 - **Per-step CPU sort and full-logit copy** on the decode path replaced by GPU-side masked top-k (equivalence verified; timing needs a GPU).
-- **Host RAM read as 16 GB on Linux** (a hard-coded placeholder); it now reads `/proc/meminfo` and the container's cgroup limit.
+- **Host RAM read as 16 GB on Linux** (a hard-coded placeholder, used for the status report only); it now reads `/proc/meminfo` and the container's cgroup limit.
+- **Parse-worker pool sized from the host, not the pod.** The default number of parse processes came from `os.cpu_count()` (the host's logical CPUs inside a container) and psutil's host-wide free RAM, with no upper bound; on a shared host that can start far more workers than the pod has cores or memory for. It now uses the pod's real CPUs (affinity and CFS quota) and the container's own memory headroom, leaves two CPUs for the trainer, and caps the pool at 24 (`CODEMIND_PREFETCH_WORKERS` still overrides).
 - **Unbounded request pile-up** on the server; optional backpressure added.
+- **A streaming feeder that could not exceed a few samples per second** (priority buffer re-scanned and re-hashed on every sample), **that did not shuffle at the start of training** (equal priorities kept insertion order), **and mixed only within one file at a time** — replaced by an interleaved, RAM-sized heap buffer.
+- **Cache accounting that ignored disk blocks and rescanned directories** from the training thread; unified into one 60 GB budget with tracked sizes, a pinned shard cache and a graph cache that stops writing when it cannot help.
+- **A file per sample for three small memories** — RAM-only above one million samples.
+- **torch's CPU thread pool left at its default** next to up to 24 parse workers — now a few threads in the trainer and one per worker.
 
 **Hardening pass**
 
@@ -1028,6 +1046,8 @@ These come from the source's own dated change markers and from the hardening pas
 | Replay buffers | 256 entries each (language, code); anchors from the latest 32 |
 | PPO | policy head with 1,024-way action space; buffer of 32; decoder RL every few steps (six by default) |
 | Math core | 69 units, 28 constants, 45 formulas, 8 curriculum templates, 16-dimensional feature vector, < 1 M learned parameters |
+| Data feeding | up to 24 parse processes (28 vCPU pod); interleave 32 files / byte ranges; shuffle buffer ≈ 425,000 samples at a 170 GB RAM budget |
+| SSD cache | 60 GB total: 40 GB pinned shard cache, 14 GB adaptive graph cache, 6 GB spill cache |
 | Search catalog | 589 trusted domains in 21 categories |
 | Safety | wordlist infrastructure for 44 languages; deflection in 16; 23 PII/secret detector kinds |
 | Checkpoints | 3 rotating slots, fixed-interval saves, atomic writes |
